@@ -3,7 +3,7 @@
   "data_root": "/mnt/home/chenxiaofu/facetrack/data/ms1mv3",
   "manifest": "",
   "online_masks": "/mnt/data/zhonghuanlong/Dataset/DeepFake/masks_packed",
-  "output": "outputs/ms1mv3_stage2/online.pth",
+  "output": "/mnt/data/fuanlan/project/ibot_progressive/outputs/ms1mv3_stage2/online.pth",
   "validation_config": "configs/stage2_validation.yaml",
   "seed": 42,
   "epochs": 5,
