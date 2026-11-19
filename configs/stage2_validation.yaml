@@ -1,0 +1,12 @@
+test:
+  data:
+    root_path: [/mnt/home/chenxiaofu/facetrack/data/deepfakes/image/celeba64_std_100c/simswap]
+    ratio: -5
+test_ori:
+  data:
+    root_path: [/mnt/home/chenxiaofu/facetrack/data/datasets/kl/celeba64_std_100c/real]
+    ratio: 1
+gallery:
+  data:
+    root_path: [/mnt/home/chenxiaofu/facetrack/data/datasets/kl/celeba64_std_100c/real]
+    ratio: 5

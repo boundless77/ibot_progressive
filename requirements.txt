@@ -1,0 +1,10 @@
+# First install a matching CUDA-enabled torch/torchvision pair for your GPU.
+# Verified code compatibility here: torch 2.14 CPU / torchvision 0.29.1 (see report).
+numpy>=1.21.6,<2
+Pillow>=9
+timm==0.4.12
+tensorboardX>=2.6
+einops>=0.6
+tqdm>=4.64
+# Only needed for offline FACER parsing; installed separately to isolate its dependencies:
+# pip install git+https://github.com/FacePerceiver/facer.git@main

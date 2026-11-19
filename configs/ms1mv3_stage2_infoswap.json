@@ -1,0 +1,15 @@
+{
+  "checkpoint": "outputs/ms1mv3_stage1/stage3.pth",
+  "data_root": "/mnt/data/zhonghuanlong/Dataset/DeepFake/Infoswap_ms1mv3_60000_10_10",
+  "manifest": "",
+  "online_masks": "",
+  "real_recordio": "/mnt/home/chenxiaofu/facetrack/data/ms1mv3",
+  "output": "outputs/ms1mv3_stage2/infoswap.pth",
+  "validation_config": "configs/stage2_validation.yaml",
+  "seed": 42,
+  "epochs": 5,
+  "batch_size": 16,
+  "num_workers": 2,
+  "lr": 0.00005,
+  "alignment_weight": 0.5
+}
