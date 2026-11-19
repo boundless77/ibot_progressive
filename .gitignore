@@ -4,3 +4,4 @@ __pycache__/
 outputs/
 checkpoints/
 data/
+mask_dict_check/
