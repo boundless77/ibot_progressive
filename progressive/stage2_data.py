@@ -1,17 +1,21 @@
-"""RecordIO pairs with the same online blending used by BlendFace training."""
+"""Stage 2 identity pairs: offline Fake/Real data and online BlendFace synthesis."""
+import json
 import os
 import pickle
 import random
+import re
+from collections import defaultdict
 from pathlib import Path
 
-import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from torchvision import transforms as T
 from torchvision.transforms import functional as TF
 
-from .recordio import image_indices, open_recordio
+from .data import EXTENSIONS, MEAN, STD
+from .recordio import image_indices, open_recordio, read_record
 
 
 def read_pickle(path):
@@ -44,6 +48,8 @@ class PackedMasks:
 
 
 def blend(target, source, target_mask, source_mask):
+    import cv2
+
     target_lab = cv2.cvtColor(target, cv2.COLOR_RGB2LAB).astype(np.float32)
     source_lab = cv2.cvtColor(source, cv2.COLOR_RGB2LAB).astype(np.float32)
     target_pixels = target_lab[target_mask == 1]
@@ -135,3 +141,89 @@ class OnlineTargets(Dataset):
         if random.random() < .5:
             fake, real = TF.hflip(fake), TF.hflip(real)
         return self.transform(fake), self.transform(real), label
+
+
+def image_transform(random_flip=True):
+    return T.Compose(
+        [
+            T.Resize((224, 224), interpolation=T.InterpolationMode.BICUBIC),
+            *([T.RandomHorizontalFlip()] if random_flip else []),
+            T.ToTensor(),
+            T.Normalize(MEAN, STD),
+        ]
+    )
+
+
+class TargetIdentityDataset(Dataset):
+    def __init__(self, manifest, root, real_recordio):
+        root = Path(root)
+        self.rows = []
+        if manifest:
+            data = json.loads(Path(manifest).read_text(encoding="utf-8"))
+            for row in data["queries"]:
+                if "target_id" in row:
+                    self.rows.append((root / row["path"], str(row["target_id"])))
+        else:
+            if not root.is_dir():
+                raise FileNotFoundError(root)
+            pattern = re.compile(r"(?:id|n)?(\d+)_(?:id|n)?(\d+)", re.IGNORECASE)
+            for folder in sorted(root.iterdir()):
+                match = pattern.fullmatch(folder.name)
+                if folder.is_dir() and match:
+                    target = str(int(match[1]))
+                    self.rows.extend(
+                        (path, target)
+                        for path in sorted(folder.iterdir())
+                        if path.is_file() and path.suffix.lower() in EXTENSIONS
+                    )
+            if not self.rows:
+                raise ValueError(
+                    "No Fake images found in target_source folders; check data_root or supply a manifest"
+                )
+        self.classes = sorted({identity for _, identity in self.rows})
+        if len(self.classes) < 2:
+            raise ValueError(
+                "Training manifest needs fake queries from at least two target identities"
+            )
+        self.class_index = {identity: index for index, identity in enumerate(self.classes)}
+        self.transform = image_transform()
+        self.real_root = Path(real_recordio)
+        with (self.real_root / "idx2label.json").open("rb") as file:
+            labels = pickle.load(file)
+        real_indices = defaultdict(list)
+        for index, identity in labels.items():
+            cls = self.class_index.get(str(int(identity)))
+            if cls is not None:
+                real_indices[cls].append(int(index))
+        missing = [
+            identity for identity, cls in self.class_index.items() if cls not in real_indices
+        ]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} Fake Targets have no MS1Mv3 Real records; example: {missing[0]}"
+            )
+        self.real_indices = dict(real_indices)
+        self.reader = None
+        self.reader_pid = None
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        path, identity = self.rows[index]
+        with Image.open(path) as image:
+            fake = self.transform(ImageOps.exif_transpose(image).convert("RGB"))
+        if self.reader_pid != os.getpid():
+            self.reader = open_recordio(self.real_root)
+            self.reader_pid = os.getpid()
+        cls = self.class_index[identity]
+        label, real = read_record(self.reader, random.choice(self.real_indices[cls]))
+        if str(label) != identity:
+            raise ValueError(f"Real RecordIO label does not match Fake Target {identity}: {path}")
+        return fake, self.transform(real), cls
+
+
+def training_data(args):
+    if args.online_masks:
+        return OnlineTargets(args.data_root, args.online_masks, image_transform(random_flip=False))
+    return TargetIdentityDataset(args.manifest, args.data_root, args.real_recordio)

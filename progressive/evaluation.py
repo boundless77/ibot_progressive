@@ -8,10 +8,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
-from torchvision.transforms import functional as TF, InterpolationMode as IM
+from torchvision.transforms import functional as TF
 from .data import MEAN, STD, load_pair
 from .masking import ProgressiveCRFRPMask, ORGANS, Stage
 from .checkpoints import trusted_load, bare_state
+from .identity import IdentityEncoder, QueryPredictor
 
 def load_full_role(checkpoint_path, device='cpu', role='teacher'):
     """For patch diagnostics only: load original backbone plus its own iBOT head."""
@@ -43,23 +44,42 @@ def load_encoder(checkpoint_path, device='cpu', role='teacher'):
 
 
 def encoder_from_checkpoint(ckpt, device='cpu', role='teacher'):
+    """Restore a complete identity encoder; qT weights are mandatory for Fake."""
     import models
+    if role not in ('student', 'teacher'):
+        raise ValueError('Identity encoder role must be student or teacher')
+    if ckpt.get('identity_readout') == 'qt':
+        required = ('encoder', 'real_encoder', 'predictor', 'predictor_config')
+        missing = [key for key in required if not ckpt.get(key)]
+        if missing:
+            raise ValueError('qT checkpoint is missing ' + ', '.join(missing))
     args = ckpt['args']; args = vars(args) if not isinstance(args, dict) else args
     if args['arch'] != 'vit_base' or args['patch_size'] != 16:
         raise ValueError('Evaluation expects ViT-B/16')
     model = models.vit_base(patch_size=16, return_all_tokens=True)
-    state = ckpt.get('real_encoder') if role == 'teacher' else None
-    if state is None:
+    if 'real_encoder' in ckpt:
+        state = ckpt['real_encoder' if role == 'teacher' else 'encoder']
+    else:
         state = ckpt.get('encoder')
     if state is None:
         state = {k[len('backbone.'):]: v for k,v in bare_state(ckpt[role]).items() if k.startswith('backbone.')}
     state = {key: value for key, value in state.items() if key != 'masked_embed'}
     model.load_state_dict(state,strict=True)
+    predictor = None
+    if ckpt.get('identity_readout') == 'qt':
+        if role == 'student':
+            predictor = QueryPredictor(**ckpt['predictor_config'])
+            if predictor.config['embed_dim'] != model.embed_dim:
+                raise ValueError('Predictor output dimension must match the backbone CLS dimension')
+            predictor.load_state_dict(ckpt['predictor'], strict=True)
+    elif 'predictor' in ckpt:
+        raise ValueError('Predictor checkpoint must declare identity_readout=qt')
+    projection = None
     projection_state = ckpt.get('identity_projection', {})
     if projection_state:
-        model.identity_projection = torch.nn.Linear(model.embed_dim,
-                                                    projection_state['weight'].shape[0], bias=False)
-        model.identity_projection.load_state_dict(projection_state, strict=True)
+        projection = torch.nn.Linear(model.embed_dim, projection_state['weight'].shape[0], bias=False)
+        projection.load_state_dict(projection_state, strict=True)
+    model = IdentityEncoder(model, predictor, projection)
     model.to(device).eval().requires_grad_(False)
     return model
 
@@ -111,12 +131,7 @@ def fixed_input(path, data_root, parsing_root, mode, mask_bank, seed=42, mask_ra
 
 @torch.inference_mode()
 def extract(model, tensor, device):
-    tokens = model(tensor.unsqueeze(0).to(device))
-    cls = tokens[:, 0]
-    if hasattr(model, 'identity_projection'):
-        cls = model.identity_projection(cls)
-    return {'cls':torch.nn.functional.normalize(cls,dim=-1).cpu()[0],
-            'patch_mean':torch.nn.functional.normalize(tokens[:,1:].mean(1),dim=-1).cpu()[0]}
+    return F.normalize(model(tensor.unsqueeze(0).to(device)).float(), dim=-1).cpu()[0]
 
 
 class RetrievalValidation:
@@ -153,7 +168,7 @@ class RetrievalValidation:
     def evaluate(self, student, real_encoder, device):
         centers = torch.zeros(self.num_identities, real_encoder.embed_dim, device=device)
         for images, labels in self.gallery:
-            cls = F.normalize(real_encoder(images.to(device))[:, 0].float(), dim=-1)
+            cls = F.normalize(real_encoder(images.to(device)).float(), dim=-1)
             centers.index_add_(0, labels.to(device), cls)
         centers = F.normalize(centers, dim=-1)
         candidates = torch.arange(self.num_identities, device=device)
@@ -169,7 +184,7 @@ class RetrievalValidation:
                 images, labels = batch
                 count += len(labels)
                 labels = labels.to(device)[:, None]
-                cls = F.normalize(model(images.to(device))[:, 0].float(), dim=-1)
+                cls = F.normalize(model(images.to(device)).float(), dim=-1)
                 scores = cls @ centers.T
                 correct_scores = scores.gather(1, labels)
                 ahead = (scores > correct_scores) | ((scores == correct_scores) & (candidates < labels))

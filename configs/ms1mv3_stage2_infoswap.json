@@ -10,6 +10,12 @@
   "epochs": 5,
   "batch_size": 16,
   "num_workers": 2,
-  "lr": 0.00005,
-  "alignment_weight": 0.5
+  "lr": 5e-05,
+  "alignment_weight": 0.5,
+  "predictor_lr": 5e-05,
+  "predictor_width": 256,
+  "predictor_heads": 4,
+  "predictor_depth": 1,
+  "fake_weight": 1.0,
+  "real_weight": 1.0
 }
