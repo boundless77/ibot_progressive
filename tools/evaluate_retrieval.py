@@ -26,8 +26,15 @@ def extract_rows(
     features = []
     logging.info("Extracting %s: %d images", name, len(rows))
     for index, row in enumerate(rows, 1):
-        tensor, _ = fixed_input(root / row["path"], root, parsing_root, mode, mask_bank)
         encoder = fake_model if fake_model is not None and "target_id" in row else model
+        tensor, _ = fixed_input(
+            root / row["path"],
+            root,
+            parsing_root,
+            mode,
+            mask_bank,
+            image_size=encoder.input_size,
+        )
         features.append(extract(encoder, tensor, device))
         if index % 256 == 0 or index == len(rows):
             logging.info("%s: %d/%d", name, index, len(rows))
@@ -99,8 +106,9 @@ def main():
     p.add_argument(
         "--modes",
         nargs="+",
-        default=["clean", "single", "double", "triple", "inner"],
+        default=["clean"],
         choices=["clean", "single", "double", "triple", "inner"],
+        help="Optional diagnostic occlusions; normal identity retrieval uses clean images",
     )
     p.add_argument("--device", default="cuda")
     p.add_argument("--output", required=True)
@@ -141,7 +149,7 @@ def main():
             raise ValueError("Fake Target and Source must be different")
     report = {
         "manifest_sha256": hashlib.sha256(raw).hexdigest(),
-        "note": "Identity retrieval: Real CLS for gallery/Real queries; qT predictor for Stage 2 Fake queries.",
+        "note": "Full-image CLS retrieval: Real encoder for gallery/Real queries, Student for Fake queries.",
         "checkpoints": {},
     }
     for checkpoint in args.checkpoints:

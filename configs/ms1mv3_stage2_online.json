@@ -16,10 +16,6 @@
   "real_lr": 1e-05,
   "warmup_ratio": 0.05,
   "min_lr_ratio": 0.1,
-  "predictor_lr": 5e-05,
-  "predictor_width": 256,
-  "predictor_heads": 4,
-  "predictor_depth": 1,
   "fake_weight": 1.0,
   "real_weight": 1.0
 }

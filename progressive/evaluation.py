@@ -12,7 +12,7 @@ from torchvision.transforms import functional as TF
 from .data import MEAN, STD, load_pair
 from .masking import ProgressiveCRFRPMask, ORGANS, Stage
 from .checkpoints import trusted_load, bare_state
-from .identity import IdentityEncoder, QueryPredictor
+from .identity import IdentityEncoder
 
 def load_full_role(checkpoint_path, device='cpu', role='teacher'):
     """For patch diagnostics only: load original backbone plus its own iBOT head."""
@@ -44,15 +44,14 @@ def load_encoder(checkpoint_path, device='cpu', role='teacher'):
 
 
 def encoder_from_checkpoint(ckpt, device='cpu', role='teacher'):
-    """Restore a complete identity encoder; qT weights are mandatory for Fake."""
+    """Load a Stage 1 backbone or a Stage 2 CLS encoder."""
     import models
     if role not in ('student', 'teacher'):
         raise ValueError('Identity encoder role must be student or teacher')
-    if ckpt.get('identity_readout') == 'qt':
-        required = ('encoder', 'real_encoder', 'predictor', 'predictor_config')
-        missing = [key for key in required if not ckpt.get(key)]
-        if missing:
-            raise ValueError('qT checkpoint is missing ' + ', '.join(missing))
+    if (ckpt.get('identity_readout') not in (None, 'cls')
+            or ckpt.get('fake_preprocess') not in (None, 'none')
+            or any(key in ckpt for key in ('predictor', 'face_parser', 'identity_projection'))):
+        raise ValueError('This CLS baseline cannot evaluate checkpoints from other readout/preprocessing experiments')
     args = ckpt['args']; args = vars(args) if not isinstance(args, dict) else args
     if args['arch'] != 'vit_base' or args['patch_size'] != 16:
         raise ValueError('Evaluation expects ViT-B/16')
@@ -65,32 +64,21 @@ def encoder_from_checkpoint(ckpt, device='cpu', role='teacher'):
         state = {k[len('backbone.'):]: v for k,v in bare_state(ckpt[role]).items() if k.startswith('backbone.')}
     state = {key: value for key, value in state.items() if key != 'masked_embed'}
     model.load_state_dict(state,strict=True)
-    predictor = None
-    if ckpt.get('identity_readout') == 'qt':
-        if role == 'student':
-            predictor = QueryPredictor(**ckpt['predictor_config'])
-            if predictor.config['embed_dim'] != model.embed_dim:
-                raise ValueError('Predictor output dimension must match the backbone CLS dimension')
-            predictor.load_state_dict(ckpt['predictor'], strict=True)
-    elif 'predictor' in ckpt:
-        raise ValueError('Predictor checkpoint must declare identity_readout=qt')
-    projection = None
-    projection_state = ckpt.get('identity_projection', {})
-    if projection_state:
-        projection = torch.nn.Linear(model.embed_dim, projection_state['weight'].shape[0], bias=False)
-        projection.load_state_dict(projection_state, strict=True)
-    model = IdentityEncoder(model, predictor, projection)
+    model = IdentityEncoder(model, input_size=ckpt.get('input_size', 224))
     model.to(device).eval().requires_grad_(False)
     return model
 
-def fixed_input(path, data_root, parsing_root, mode, mask_bank, seed=42, mask_ratio=None):
+def fixed_input(path, data_root, parsing_root, mode, mask_bank, seed=42, mask_ratio=None,
+                image_size=224):
     """Fixed RGB-space occlusion at ImageNet mean; identical bank for every model."""
     from PIL import ImageOps
     with Image.open(path) as im:
-        rgb = ImageOps.exif_transpose(im).convert('RGB').resize((224,224),Image.Resampling.BICUBIC)
+        rgb = ImageOps.exif_transpose(im).convert('RGB').resize((image_size,image_size),Image.Resampling.BICUBIC)
     image = TF.normalize(TF.to_tensor(rgb),MEAN,STD)
     if mode == 'clean':
-        return image, np.zeros((14,14),bool)
+        return image, np.zeros((image_size // 16, image_size // 16),bool)
+    if image_size != 224:
+        raise ValueError('Additional patch-occlusion modes require 224px images')
     if not parsing_root or not mask_bank:
         raise ValueError('Occluded evaluation needs parsing_root and a shared mask_bank')
     _, labels = load_pair(path,data_root,parsing_root)
@@ -135,7 +123,7 @@ def extract(model, tensor, device):
 
 
 class RetrievalValidation:
-    def __init__(self, config_path, batch_size, num_workers):
+    def __init__(self, config_path, batch_size, num_workers, image_size=224):
         from omegaconf import OmegaConf
         from .validation_data import validation_paths
 
@@ -156,7 +144,8 @@ class RetrievalValidation:
             samples = [(Path(path), class_index[identity])
                        for identity, paths in idbook.items() for path in paths]
             return DataLoader(samples, batch_size=batch_size, num_workers=num_workers,
-                              collate_fn=partial(load_validation_batch, skip_unreadable=skip_unreadable))
+                              collate_fn=partial(load_validation_batch, skip_unreadable=skip_unreadable,
+                                                 image_size=image_size))
 
         self.gallery = loader(gallery)
         self.fake = loader(fake)
@@ -201,11 +190,11 @@ class RetrievalValidation:
         return results
 
 
-def load_validation_batch(samples, skip_unreadable=False):
+def load_validation_batch(samples, skip_unreadable=False, image_size=224):
     images, labels = [], []
     for path, label in samples:
         try:
-            images.append(fixed_input(path, None, None, 'clean', None)[0])
+            images.append(fixed_input(path, None, None, 'clean', None, image_size=image_size)[0])
         except (OSError, ValueError):
             if not skip_unreadable:
                 raise

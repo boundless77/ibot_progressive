@@ -1,4 +1,4 @@
-"""Train a qT identity readout on Fake and a CLS identity encoder on Real."""
+"""Train full-image Fake and Real CLS features for target identity retrieval."""
 
 import _bootstrap
 import argparse
@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from progressive.checkpoints import trusted_load
 from progressive.evaluation import RetrievalValidation, encoder_from_checkpoint
-from progressive.identity import ArcFace, QueryPredictor, Stage2
+from progressive.identity import ArcFace, Stage2
 from progressive.stage2_data import training_data
 
 
@@ -126,15 +126,11 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--student_lr", type=float, help="Peak encoder LR; defaults to lr")
     parser.add_argument("--head_lr", type=float, help="Peak ArcFace LR; defaults to lr")
-    parser.add_argument("--predictor_lr", type=float, help="Peak qT/predictor LR; defaults to lr")
     parser.add_argument("--real_lr", type=float, help="Peak Real encoder LR; defaults to lr")
     parser.add_argument("--warmup_ratio", type=float, default=0.0)
     parser.add_argument("--min_lr_ratio", type=float, default=1.0)
     parser.add_argument("--fake_weight", type=float, default=1.0)
     parser.add_argument("--real_weight", type=float, default=1.0)
-    parser.add_argument("--predictor_width", type=int, default=256)
-    parser.add_argument("--predictor_heads", type=int, default=4)
-    parser.add_argument("--predictor_depth", type=int, default=1)
     parser.add_argument("--local-rank", "--local_rank", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.config:
@@ -146,12 +142,12 @@ def parse_args():
         args = parser.parse_args()
     if not all((args.checkpoint, args.data_root, args.output)):
         parser.error("checkpoint, data_root and output are required")
-    for name in ("student_lr", "head_lr", "predictor_lr", "real_lr"):
+    for name in ("student_lr", "head_lr", "real_lr"):
         value = getattr(args, name)
         setattr(args, name, args.lr if value is None else value)
     if any(
         not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0
-        for name in ("lr", "student_lr", "head_lr", "predictor_lr", "real_lr")
+        for name in ("lr", "student_lr", "head_lr", "real_lr")
     ):
         parser.error("Learning rates must be finite and positive")
     if not 0 <= args.warmup_ratio < 1 or not 0 <= args.min_lr_ratio <= 1:
@@ -160,15 +156,6 @@ def parse_args():
     if any(not math.isfinite(value) or value < 0 for value in weights) or not any(weights):
         parser.error(
             "Loss weights must be finite and nonnegative, with at least one positive weight"
-        )
-    if (
-        args.predictor_width < 1
-        or args.predictor_heads < 1
-        or args.predictor_width % args.predictor_heads
-        or args.predictor_depth < 1
-    ):
-        parser.error(
-            "Predictor width must be positive and divisible by heads; depth must be positive"
         )
     if args.epochs < 1 or args.batch_size < 1 or args.verbose < 1 or args.num_workers < 0:
         parser.error("Invalid training settings")
@@ -191,9 +178,7 @@ def build_model(args, device, num_classes):
         )
     student = encoder_from_checkpoint(checkpoint, device, role="student").requires_grad_(True)
     real_encoder = encoder_from_checkpoint(checkpoint, device, role="teacher")
-    student.predictor = QueryPredictor(
-        student.embed_dim, args.predictor_width, args.predictor_heads, args.predictor_depth
-    ).to(device)
+    student.input_size = real_encoder.input_size = 224
     real_encoder.backbone.blocks[-2:].requires_grad_(True)
     real_encoder.backbone.norm.requires_grad_(True)
     head = ArcFace(student.embed_dim, num_classes).to(device)
@@ -203,17 +188,13 @@ def build_model(args, device, num_classes):
         and torch.cuda.get_device_capability(device)[0] >= 8
         and torch.cuda.is_bf16_supported()
     )
-    logging.info("Single qT predictor: %s", student.predictor.config)
-    logging.info(
-        "Encoder/predictor precision: %s; losses use FP32", "BF16 autocast" if use_bf16 else "FP32"
-    )
+    logging.info("Encoder precision: %s; losses use FP32", "BF16 autocast" if use_bf16 else "FP32")
     return Stage2(student, real_encoder, head, use_bf16)
 
 
 def build_optimizer(model, args):
     modules = (
         ("student", model.student.backbone, args.student_lr),
-        ("predictor", model.student.predictor, args.predictor_lr),
         ("arcface", model.head, args.head_lr),
         ("real", model.real_encoder, args.real_lr),
     )
@@ -243,12 +224,10 @@ def build_optimizer(model, args):
 
 def save_checkpoint(model, identities, args, path, epoch, step, metrics):
     state = {
-        "format_version": 2,
-        "identity_readout": "qt",
+        "identity_readout": "cls",
+        "input_size": model.student.input_size,
         "encoder": model.student.backbone.state_dict(),
         "real_encoder": model.real_encoder.backbone.state_dict(),
-        "predictor": model.student.predictor.state_dict(),
-        "predictor_config": model.student.predictor.config,
         "arcface": model.head.state_dict(),
         "identities": identities,
         "epoch": epoch,
@@ -437,6 +416,7 @@ def main():
                         args.validation_config,
                         min(args.batch_size, 64),
                         0 if distributed else args.num_workers,
+                        image_size=real_encoder.input_size,
                     )
                     logging.info(
                         "Validation image selection took %.1fs",
