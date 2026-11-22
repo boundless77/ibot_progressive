@@ -3,9 +3,6 @@
   "parsing_root": "outputs/ms1mv3_index",
   "packed_mask_dir": "/mnt/data/fuanlan/Dataset/ibot_ms1mv3/packed-masks",
   "blendface_masks": "/mnt/data/zhonghuanlong/Dataset/DeepFake/masks",
-  "detector_weights": "../FSFM/checkpoints/mobilenet0.25_Final.pth",
-  "parser_weights": "../FSFM/checkpoints/face_parsing.farl.lapa.main_ema_136500_jit191.pt",
-  "manifest": "",
   "pretrained": "checkpoints/ibot_vitb16_full.pth",
   "resume": "",
   "output_dir": "outputs/ms1mv3_stage1",
@@ -46,7 +43,7 @@
   "batch_size_per_gpu": 256,
   "num_workers": 8,
   "lr": 0.0001,
-  "min_lr": 1E-06,
+  "min_lr": 1e-06,
   "warmup_epochs": 1,
   "weight_decay": 0.04,
   "weight_decay_end": 0.4,
@@ -64,6 +61,5 @@
   "use_fp16": true,
   "seed": 42,
   "saveckp_freq": 0,
-  "recordio_shards": 1,
   "verbose": 2000
 }

@@ -93,8 +93,6 @@ def restore_experiment(checkpoint, args, optimizer, scaler, loss):
         raise ValueError('--resume only accepts a checkpoint from this experiment')
     saved_args = checkpoint['args']
     saved_args = vars(saved_args) if isinstance(saved_args, argparse.Namespace) else saved_args
-    if saved_args.get('recordio_shards', 0) != getattr(args, 'recordio_shards', 0):
-        raise ValueError('Resume configuration differs: recordio_shards')
     if saved_args.get('visible_decoder', False) != getattr(args, 'visible_decoder', False):
         raise ValueError('Resume configuration differs: visible_decoder')
     if getattr(args, 'visible_decoder', False):
@@ -105,7 +103,7 @@ def restore_experiment(checkpoint, args, optimizer, scaler, loss):
     for key in ('stages', 'epochs', 'batch_size_per_gpu', 'lr', 'min_lr', 'warmup_epochs',
                 'momentum_teacher', 'weight_decay', 'weight_decay_end', 'global_crops_scale',
                 'local_crops_scale', 'global_crops_number', 'local_crops_number', 'seed',
-                'data_path', 'parsing_root', 'manifest', 'require_full_organs', 'optimizer',
+                'data_path', 'parsing_root', 'require_full_organs', 'optimizer',
                 'teacher_temp', 'teacher_patch_temp', 'warmup_teacher_temp_epochs', 'use_fp16'):
         if saved_args.get(key) != getattr(args, key):
             raise ValueError('Resume configuration differs: %s' % key)

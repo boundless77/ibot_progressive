@@ -27,7 +27,7 @@ from pathlib import Path
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 from models.head import iBOTHead
-from progressive.data import FaceMaskDataset, PairedFaceAugmentation, audit_overflows
+from progressive.data import PairedFaceAugmentation, audit_overflows
 from progressive.checkpoints import (read_initial_checkpoint, load_models, load_centers,
                                      restore_experiment, capture_rng)
 from progressive.visible_decoder import VisiblePatchStudent
@@ -93,24 +93,16 @@ def train_ibot(args):
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
-    recordio = bool(args.recordio_shards)
     transform = PairedFaceAugmentation(
         args.global_crops_scale, args.local_crops_scale,
         args.global_crops_number, args.local_crops_number,
         args.require_full_organs,
-        crop_validator=GlobalCropValidator(args.patch_size, .75) if recordio else None)
-    if recordio:
-        dataset = RecordIOFaceMaskDataset(args.data_path, args.parsing_root, args.stages,
-                                         args.patch_size, transform, args.seed, args.recordio_shards,
-                                         getattr(args, 'blendface_masks', None),
-                                         getattr(args, 'packed_mask_dir', None))
-        if dataset.packed_mask_path is not None:
-            logger.info('Packed masks: %s', dataset.packed_mask_path)
-        logger.debug('RecordIO counts: %s', dataset.counts)
-    else:
-        dataset = FaceMaskDataset(args.data_path, args.parsing_root, args.stages,
-                                  args.patch_size, transform, args.seed, args.manifest,
-                                  strict_budget=args.visible_decoder)
+        crop_validator=GlobalCropValidator(args.patch_size, .75))
+    dataset = RecordIOFaceMaskDataset(
+        args.data_path, args.parsing_root, args.stages, args.patch_size,
+        transform, args.seed, getattr(args, 'packed_mask_dir', None))
+    logger.info('Packed masks: %s', dataset.packed_mask_path)
+    logger.debug('RecordIO counts: %s', dataset.counts)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -120,7 +112,7 @@ def train_ibot(args):
         # Workers start after NCCL initialization, so avoid inheriting it via fork.
         multiprocessing_context='spawn' if args.num_workers > 0 else None,
         pin_memory=True,
-        drop_last=not recordio,
+        drop_last=False,
     )
     if len(data_loader) == 0:
         raise ValueError("Dataset is smaller than one distributed batch; reduce batch size")

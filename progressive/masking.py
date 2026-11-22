@@ -25,7 +25,7 @@ class Stage:
 class ProgressiveCRFRPMask:
     def __init__(self, stages=None, patch_size=16):
         self.stages = [Stage(**s) if isinstance(s, dict) else s for s in
-                       (stages or [Stage(5, 1, .3), Stage(10, 2, .4), Stage(15, 3, .5)])]
+                       (stages or [Stage(5, 1, .75), Stage(10, 2, .75), Stage(15, 3, .75)])]
         self.patch_size = patch_size
         previous = 0
         for s in self.stages:

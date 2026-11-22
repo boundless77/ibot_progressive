@@ -1,36 +1,18 @@
-"""Offline FACER maps, joint geometric augmentation, iBOT-compatible tuple output."""
+"""Joint augmentation and progressive masking for MS1Mv3 RecordIO samples."""
 import hashlib
 import json
 import random
 from pathlib import Path
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 from torchvision.transforms import functional as TF, InterpolationMode as IM
-from .masking import ProgressiveCRFRPMask, ORGANS, LAPA_LABELS
+from .masking import ProgressiveCRFRPMask, ORGANS
 
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-
-def image_paths(root):
-    return sorted(p for p in Path(root).rglob('*') if p.suffix.lower() in EXTENSIONS)
-
-def cache_path(image, data_root, parsing_root):
-    return Path(parsing_root) / (str(Path(image).relative_to(data_root)) + '.png')
-
-def load_pair(path, data_root, parsing_root):
-    # Apply EXIF once, in the parser preprocessing stage too.
-    from PIL import ImageOps
-    with Image.open(path) as im:
-        image = ImageOps.exif_transpose(im).convert('RGB')
-    with Image.open(cache_path(path, data_root, parsing_root)) as im:
-        labels = im.copy()
-    if image.size != labels.size:
-        raise ValueError('Image/parsing dimensions differ: %s' % path)
-    return image, labels
 
 def joint_geometry(image, labels, box, size, flip):
     """One sampled crop and flip used by both RGB and integer semantic labels."""
@@ -97,39 +79,15 @@ class PairedFaceAugmentation:
         return views, maps, geometry
 
 class FaceMaskDataset(Dataset):
-    def __init__(self, data_root, parsing_root, stages, patch_size, augmentation,
-                 seed=0, manifest=None, strict_budget=False):
-        self.data_root, self.parsing_root = Path(data_root), Path(parsing_root)
-        if self.data_root.resolve() == self.parsing_root.resolve() or self.data_root.resolve() in self.parsing_root.resolve().parents:
-            raise ValueError('parsing_root must be outside data_root')
-        metadata_path = self.parsing_root / 'metadata.json'
-        if not metadata_path.is_file():
-            raise FileNotFoundError('Missing parsing metadata; first run tools/prepare_parsing.py')
-        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
-        if metadata.get('parser') != 'farl/lapa/448' or metadata.get('labels') != LAPA_LABELS:
-            raise ValueError('Cache must use verified FACER LaPa label IDs')
-        self.paths = ([self.data_root / line.strip() for line in Path(manifest).read_text(encoding='utf-8').splitlines()
-                       if line.strip()] if manifest else image_paths(data_root))
-        if not self.paths:
-            raise ValueError('No images found; set data_path or manifest')
-        for path in self.paths:
-            if not path.is_file() or not cache_path(path, self.data_root, parsing_root).is_file():
-                raise FileNotFoundError('Missing RGB or parsing cache: %s' % path)
-        self.generator = ProgressiveCRFRPMask(stages, patch_size)
-        self.strict_budget = strict_budget
-        self.augmentation, self.seed, self.epoch = augmentation, seed, 0
+    """Common augmentation and mask generation for RecordIO samples."""
 
-    def __len__(self):
-        return len(self.paths)
+    def __init__(self, stages, patch_size, augmentation, seed=0):
+        self.generator = ProgressiveCRFRPMask(stages, patch_size)
+        self.strict_budget = True
+        self.augmentation, self.seed, self.epoch = augmentation, seed, 0
 
     def set_epoch(self, epoch):
         self.epoch = epoch
-
-    def __getitem__(self, index):
-        return self.make_sample(index, *load_pair(self.paths[index], self.data_root, self.parsing_root))
-
-    def sample_name(self, index):
-        return str(self.paths[index])
 
     def make_sample(self, index, image, labels):
         # Per-index/epoch seed is independent of worker scheduling and resume.

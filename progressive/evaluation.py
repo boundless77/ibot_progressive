@@ -9,10 +9,21 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision.transforms import functional as TF
-from .data import MEAN, STD, load_pair
+from .data import MEAN, STD
 from .masking import ProgressiveCRFRPMask, ORGANS, Stage
 from .checkpoints import trusted_load, bare_state
 from .identity import IdentityEncoder
+
+def load_pair(path, data_root, parsing_root):
+    # Apply EXIF once, in the parser preprocessing stage too.
+    from PIL import ImageOps
+    with Image.open(path) as im:
+        image = ImageOps.exif_transpose(im).convert('RGB')
+    with Image.open(Path(parsing_root) / (str(Path(path).relative_to(data_root)) + '.png')) as im:
+        labels = im.copy()
+    if image.size != labels.size:
+        raise ValueError('Image/parsing dimensions differ: %s' % path)
+    return image, labels
 
 def load_full_role(checkpoint_path, device='cpu', role='teacher'):
     """For patch diagnostics only: load original backbone plus its own iBOT head."""

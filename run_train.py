@@ -58,7 +58,6 @@ TRAINING_DEFAULTS = {
     'num_workers': 10,
     'dist_url': 'env://',
     'local_rank': 0,
-    'recordio_shards': 0,
     'verbose': 2000,
 }
 
@@ -69,8 +68,8 @@ LEGACY_OPTIONS = ('window_size', 'pred_ratio', 'pred_ratio_var', 'pred_shape', '
 def read_stage1_config(path=DEFAULT_STAGE1_CONFIG, overrides=None):
     config = json.loads(Path(path).read_text(encoding='utf-8-sig'))
     config.update({key: value for key, value in (overrides or {}).items() if value is not None})
-    for name in ('data_path', 'parsing_root', 'manifest', 'pretrained', 'resume', 'output_dir',
-                 'detector_weights', 'parser_weights', 'blendface_masks', 'packed_mask_dir'):
+    for name in ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir',
+                 'blendface_masks', 'packed_mask_dir'):
         if config.get(name):
             config[name] = str((ROOT / Path(config[name]).expanduser()).resolve())
     return config
@@ -79,18 +78,17 @@ def read_stage1_config(path=DEFAULT_STAGE1_CONFIG, overrides=None):
 def parse_config():
     cli = argparse.ArgumentParser()
     cli.add_argument('--config', default=str(DEFAULT_STAGE1_CONFIG))
-    for name in ('data_path', 'parsing_root', 'manifest', 'pretrained', 'resume', 'output_dir', 'blendface_masks'):
+    for name in ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir', 'packed_mask_dir'):
         cli.add_argument('--' + name)
     cli.add_argument('--batch_size_per_gpu', type=int)
     cli.add_argument('--num_workers', type=int)
     cli.add_argument('--lr', type=float)
     cli.add_argument('--verbose', type=int)
-    cli.add_argument('--recordio_shards', type=int)
     cli.add_argument('--check_only', action='store_true')
     cli.add_argument('--local-rank', '--local_rank', type=int, default=0)
     parsed = cli.parse_args()
-    keys = ('data_path', 'parsing_root', 'manifest', 'pretrained', 'resume', 'output_dir',
-            'batch_size_per_gpu', 'num_workers', 'lr', 'verbose', 'recordio_shards', 'blendface_masks')
+    keys = ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir',
+            'batch_size_per_gpu', 'num_workers', 'lr', 'verbose', 'packed_mask_dir')
     overrides = {name: getattr(parsed, name) for name in keys}
     if parsed.resume and parsed.pretrained is None:
         overrides['pretrained'] = ''
@@ -109,22 +107,17 @@ def parse_config():
         config['output_dir'] = str(Path(config['resume']).parent)
     if config.get('verbose', 2000) < 1 or config.get('lr', 5e-5) <= 0:
         raise SystemExit('verbose and lr must be positive')
-    shards = config.get('recordio_shards', 0)
-    if shards:
-        if shards < 1 or not config.get('visible_decoder') or config.get('manifest'):
-            raise SystemExit('RecordIO requires positive shard count, visible decoder and no image manifest')
-        if config.get('blendface_masks'):
-            if shards != 1 or not Path(config['blendface_masks']).is_dir():
-                raise SystemExit('BlendFace requires recordio_shards=1 and an existing blendface_masks directory')
-            required_cache = ['index.json', 'valid-records.npy']
-        else:
-            required_cache = [f'parsing-{i:04d}.sqlite' for i in range(shards)]
-        cache_root = Path(config['parsing_root'])
-        missing_cache = [str(cache_root / name) for name in required_cache if not (cache_root / name).is_file()]
-        if missing_cache:
-            raise SystemExit('Run tools/prepare_ms1mv3.py first. Missing cache shards: ' + ', '.join(missing_cache))
-        if not all((Path(config['data_path']) / name).is_file() for name in ('train.idx', 'train.rec')):
-            raise SystemExit('RecordIO data_path must contain train.idx and train.rec')
+    data_root = Path(config['data_path'])
+    if not all((data_root / name).is_file() for name in ('train.idx', 'train.rec')):
+        cli.error('data_path must contain MS1Mv3 train.idx and train.rec')
+    cache_root = Path(config['parsing_root'])
+    packed_root = Path(config['packed_mask_dir']) if config.get('packed_mask_dir') else cache_root / 'packed-masks'
+    required_cache = [cache_root / 'index.json', cache_root / 'valid-records.npy',
+                      packed_root / 'progress.json', packed_root / 'masks.npy']
+    missing_cache = [str(path) for path in required_cache if not path.is_file()]
+    if missing_cache:
+        cli.error('Run tools/prepare_ms1mv3.py, then the same command with --pack_masks. Missing: '
+                  + ', '.join(missing_cache))
     from progressive.masking import ProgressiveCRFRPMask
     generator = ProgressiveCRFRPMask(config['stages'], config['patch_size'])
     if config['epochs'] != generator.stages[-1].end_epoch:
@@ -140,8 +133,8 @@ def parse_config():
     for key in LEGACY_OPTIONS:
         config.pop(key, None)
     unknown = set(config) - TRAINING_DEFAULTS.keys() - {
-        'parsing_root', 'manifest', 'pretrained', 'resume', 'stages', 'require_full_organs',
-        'detector_weights', 'parser_weights', 'blendface_masks', 'packed_mask_dir',
+        'parsing_root', 'pretrained', 'resume', 'stages', 'require_full_organs',
+        'blendface_masks', 'packed_mask_dir',
     }
     if unknown:
         cli.error('Unknown config keys: ' + str(sorted(unknown)))
