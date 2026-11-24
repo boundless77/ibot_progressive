@@ -74,9 +74,10 @@ def blend(target, source, target_mask, source_mask):
 
 
 class OnlineTargets(Dataset):
-    def __init__(self, root, masks, transform):
+    def __init__(self, root, masks, transform, include_source=False):
         self.root = Path(root)
         self.transform = transform
+        self.include_source = include_source
         self.reader = open_recordio(self.root)
         self.reader_pid = os.getpid()
         indices = np.asarray(image_indices(self.reader))
@@ -87,7 +88,8 @@ class OnlineTargets(Dataset):
         self.neighbors = read_pickle(self.root / "idx2nearestidxs.pkl")
         self.masks = PackedMasks(masks)
         self.labels, self.image_ids = self.read_metadata(indices)
-        self.classes = sorted({str(self.labels[int(index)]) for index in self.indices})
+        class_records = indices if include_source else self.indices
+        self.classes = sorted({str(self.labels[int(index)]) for index in class_records})
         if len(self.classes) < 2:
             raise ValueError("Online training requires at least two target identities")
         self.class_index = {int(label): index for index, label in enumerate(self.classes)}
@@ -143,11 +145,18 @@ class OnlineTargets(Dataset):
             images.append(mx.image.imdecode(encoded).asnumpy())
             masks.append(self.masks.get(self.labels[record], self.image_ids[record]))
         target, source = images
+        if self.include_source and self.labels[target_index] == self.labels[source_index]:
+            raise ValueError(f"Online Target/Source identities must differ: {target_index}, {source_index}")
         fake = blend(target, source, *masks)
         label = self.class_index[self.labels[target_index]]
         fake, real = Image.fromarray(fake), Image.fromarray(target)
         if random.random() < 0.5:
             fake, real = TF.hflip(fake), TF.hflip(real)
+            source = np.ascontiguousarray(source[:, ::-1])
+        if self.include_source:
+            source_label = self.class_index[self.labels[source_index]]
+            return (self.transform(fake), self.transform(real),
+                    self.transform(Image.fromarray(source)), label, source_label)
         return self.transform(fake), self.transform(real), label
 
 
@@ -163,14 +172,18 @@ def image_transform(random_flip=True):
 
 
 class TargetIdentityDataset(Dataset):
-    def __init__(self, manifest, root, real_recordio):
+    def __init__(self, manifest, root, real_recordio, include_source=False):
         root = Path(root)
+        self.include_source = include_source
         self.rows = []
         if manifest:
             data = json.loads(Path(manifest).read_text(encoding="utf-8"))
             for row in data["queries"]:
                 if "target_id" in row:
-                    self.rows.append((root / row["path"], str(row["target_id"])))
+                    if include_source and "source_id" not in row:
+                        raise ValueError(f"Group training requires source_id: {row['path']}")
+                    source = str(int(row["source_id"])) if include_source else None
+                    self.rows.append((root / row["path"], str(int(row["target_id"])), source))
         else:
             if not root.is_dir():
                 raise FileNotFoundError(root)
@@ -180,7 +193,7 @@ class TargetIdentityDataset(Dataset):
                 if folder.is_dir() and match:
                     target = str(int(match[1]))
                     self.rows.extend(
-                        (path, target)
+                        (path, target, str(int(match[2])) if include_source else None)
                         for path in sorted(folder.iterdir())
                         if path.is_file() and path.suffix.lower() in EXTENSIONS
                     )
@@ -188,7 +201,13 @@ class TargetIdentityDataset(Dataset):
                 raise ValueError(
                     "No Fake images found in target_source folders; check data_root or supply a manifest"
                 )
-        self.classes = sorted({identity for _, identity in self.rows})
+        identities = {target for _, target, _ in self.rows}
+        if include_source:
+            for path, target, source in self.rows:
+                if target == source:
+                    raise ValueError(f"Fake Target/Source identities must differ: {path}")
+                identities.add(source)
+        self.classes = sorted(identities)
         if len(self.classes) < 2:
             raise ValueError(
                 "Training manifest needs fake queries from at least two target identities"
@@ -208,7 +227,7 @@ class TargetIdentityDataset(Dataset):
         ]
         if missing:
             raise ValueError(
-                f"{len(missing)} Fake Targets have no MS1Mv3 Real records; example: {missing[0]}"
+                f"{len(missing)} training identities have no MS1Mv3 Real records; example: {missing[0]}"
             )
         self.real_indices = dict(real_indices)
         self.reader = None
@@ -218,7 +237,7 @@ class TargetIdentityDataset(Dataset):
         return len(self.rows)
 
     def __getitem__(self, index):
-        path, identity = self.rows[index]
+        path, identity, source_identity = self.rows[index]
         with Image.open(path) as image:
             fake = self.transform(ImageOps.exif_transpose(image).convert("RGB"))
         if self.reader_pid != os.getpid():
@@ -228,10 +247,17 @@ class TargetIdentityDataset(Dataset):
         label, real = read_record(self.reader, random.choice(self.real_indices[cls]))
         if str(label) != identity:
             raise ValueError(f"Real RecordIO label does not match Fake Target {identity}: {path}")
+        if self.include_source:
+            source_cls = self.class_index[source_identity]
+            source_label, source = read_record(self.reader, random.choice(self.real_indices[source_cls]))
+            if str(source_label) != source_identity:
+                raise ValueError(f"Real RecordIO label does not match Fake Source {source_identity}: {path}")
+            return fake, self.transform(real), self.transform(source), cls, source_cls
         return fake, self.transform(real), cls
 
 
 def training_data(args):
+    include_source = getattr(args, "student_arch", "cls") == "groupvit"
     if args.online_masks:
-        return OnlineTargets(args.data_root, args.online_masks, image_transform(random_flip=False))
-    return TargetIdentityDataset(args.manifest, args.data_root, args.real_recordio)
+        return OnlineTargets(args.data_root, args.online_masks, image_transform(random_flip=False), include_source)
+    return TargetIdentityDataset(args.manifest, args.data_root, args.real_recordio, include_source)

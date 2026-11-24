@@ -1,6 +1,6 @@
 """Visualize actual per-layer ViT CLS attention on Fake and Real images.
 
-Run from ibot_progressive; see visualize_attention.md for examples and semantics.
+Run from ibot_progressive. Pair pre-generated Fake images with exact Target originals.
 No training, masking, gradients, attention rollout, or face alignment is applied.
 """
 
@@ -8,6 +8,7 @@ import _bootstrap
 import argparse
 import json
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -24,32 +25,38 @@ from torchvision.transforms import functional as TF
 from progressive.checkpoints import trusted_load
 from progressive.data import EXTENSIONS, MEAN, STD
 from progressive.evaluation import encoder_from_checkpoint
+from progressive.validation_data import get_all_image_files
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(model="ibot"):
+    parser = argparse.ArgumentParser(description=__doc__ if model == "ibot" else
+                                     "Visualize ICT inner/outer attention on exact Fake/Target pairs")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--data_config", default="configs/stage2_validation.yaml",
                         help="Use test/test_ori root_path when explicit image paths are absent")
     parser.add_argument("--fake_paths", nargs="+", help="Image files or recursively searched directories")
     parser.add_argument("--real_paths", nargs="+", help="Image files or recursively searched directories")
-    parser.add_argument("--num_images", type=int, default=8, help="Count PER group; 0 selects all")
+    parser.add_argument("--num_images", type=int, default=8, help="Number of Fake / original Target pairs; 0 selects all")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--layers", nargs="+", type=int, default=[3, 6, 9, 12],
                         help="1-based transformer layers")
     parser.add_argument("--heads", nargs="+", default=["mean"],
                         help="mean, all (mean plus every head), or 1-based head numbers")
-    parser.add_argument("--fake_role", choices=["student", "teacher"], default="student")
-    parser.add_argument("--real_role", choices=["student", "teacher"], default="student")
+    if model == "ibot":
+        parser.add_argument("--fake_role", choices=["student", "teacher"], default="student")
+        parser.add_argument("--real_role", choices=["student", "teacher"], default="student")
+    else:
+        parser.add_argument("--tokens", nargs="+", choices=["inner", "outer"], default=["inner", "outer"])
     parser.add_argument("--image_alpha", type=float, default=0.35,
                         help="Original-image opacity over white under the heatmap")
     parser.add_argument("--heatmap_alpha", type=float, default=0.65)
     parser.add_argument("--scale", choices=["shared", "panel"], default="shared",
-                        help="Shared raw probability scale per image, or per-panel min/max")
+                        help="Shared raw probability scale per Fake/Real pair, or per-panel min/max")
     parser.add_argument("--save_full_attention", action="store_true",
                         help="Also save every selected layer's [head, query, key] matrix")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--output_dir", default="outputs/attention")
+    parser.add_argument("--output_dir", default="/mnt/data/fuanlan/project/ibot_progressive/outputs/attention" +
+                        ("_ict" if model == "ict" else ""))
     args = parser.parse_args()
     if args.num_images < 0:
         parser.error("--num_images must be >= 0")
@@ -72,13 +79,13 @@ def image_sources(args):
     return sources
 
 
-def select_images(sources, count, seed):
+def collect_images(sources):
     paths = set()
     for source in sources:
         source = Path(source).expanduser().resolve()
         if source.is_dir():
-            paths.update(path.resolve() for path in source.rglob("*")
-                         if path.is_file() and path.suffix.lower() in EXTENSIONS)
+            paths.update(Path(path).resolve() for path in get_all_image_files(source)
+                         if Path(path).suffix.lower() in EXTENSIONS)
         elif source.is_file() and source.suffix.lower() in EXTENSIONS:
             paths.add(source)
         else:
@@ -86,9 +93,44 @@ def select_images(sources, count, seed):
     paths = sorted(paths)
     if not paths:
         raise ValueError(f"No images found in {sources}")
-    if count and count > len(paths):
-        raise ValueError(f"Requested {count} images, but only found {len(paths)} in {sources}")
-    return random.Random(seed).sample(paths, count) if count else paths
+    return paths
+
+
+def select_pairs(sources, count, seed):
+    """Use the exact Target-image naming rule from FSFM/trace_target/test_same_image.py.
+
+    Fake: <target_id>_<source_id>/<target_stem>_<source_stem>.png
+    Real: <target_id>/<target_stem>.jpg (other supported extensions also accepted).
+    Missing or ambiguous originals are errors, never same-identity replacements.
+    """
+    fake_paths = collect_images(sources["fake"])
+    if count and count > len(fake_paths):
+        raise ValueError(f"Requested {count} pairs, but only found {len(fake_paths)} Fake images")
+    selected = random.Random(seed).sample(fake_paths, count) if count else fake_paths
+    real_index = {}
+    identity_pattern = re.compile(r"(?:id|n)?(\d+)", re.IGNORECASE)
+    for path in collect_images(sources["real"]):
+        match = identity_pattern.fullmatch(path.parent.name)
+        if match is None:
+            raise ValueError(f"Expected a Real identity directory such as 12 or id12: {path}")
+        key = (str(int(match[1])), path.stem)
+        real_index.setdefault(key, []).append(path)
+    pair_pattern = re.compile(r"(?:id|n)?(\d+)_(?:id|n)?(\d+)", re.IGNORECASE)
+    pairs = []
+    for fake in selected:
+        match = pair_pattern.fullmatch(fake.parent.name)
+        if match is None:
+            raise ValueError(f"Expected a target_source Fake directory: {fake}")
+        target, source = (str(int(value)) for value in match.groups())
+        target_stem, separator, source_stem = fake.stem.partition("_")
+        if not (target_stem and separator and source_stem):
+            raise ValueError(f"Expected a <target_stem>_<source_stem> Fake filename: {fake}")
+        originals = real_index.get((target, target_stem), [])
+        if len(originals) != 1:
+            raise ValueError(f"Expected exactly one original Target image for {fake}; "
+                             f"Target={target}, image={target_stem}, matches={originals}")
+        pairs.append({"fake": fake, "real": originals[0], "target_id": target, "source_id": source})
+    return pairs
 
 
 class AttentionCapture:
@@ -129,12 +171,17 @@ def selected_heads(values, count):
     return heads
 
 
-def save_figure(image, maps, heads, layers, title, output, args):
+def save_figure(records, heads, layers, title, output, args,
+                query_label="CLS query -> patch keys; no rollout"):
     # Interpolate spatial maps only; never interpolate the token-token matrix.
-    panels = torch.stack([
-        torch.stack([maps[layer].mean(0) if head is None else maps[layer][head]
-                     for layer in layers]) for head in heads
-    ])
+    panels = []
+    for head in heads:
+        for record in records:
+            maps = record["maps"]
+            panels.append(torch.stack([maps[layer].mean(0) if head is None else maps[layer][head]
+                                       for layer in layers]))
+    panels = torch.stack(panels)
+    image = records[0]["image"]
     rows, columns, height, width = panels.shape
     panels = F.interpolate(panels.reshape(-1, 1, height, width),
                            size=(image.height, image.width), mode="nearest")
@@ -143,12 +190,15 @@ def save_figure(image, maps, heads, layers, title, output, args):
     fig, axes = plt.subplots(rows, columns + 1, figsize=(2.6 * (columns + 1), 2.8 * rows),
                              squeeze=False, layout="constrained")
     try:
-        background = np.asarray(image, dtype=np.float32) / 255
-        background = args.image_alpha * background + (1 - args.image_alpha)
-        for row, head in enumerate(heads):
+        for row in range(rows):
+            head = heads[row // len(records)]
+            record = records[row % len(records)]
+            image = record["image"]
+            background = np.asarray(image, dtype=np.float32) / 255
+            background = args.image_alpha * background + (1 - args.image_alpha)
             label = "Head mean" if head is None else f"Head {head + 1}"
             axes[row, 0].imshow(image)
-            axes[row, 0].set_title(f"Input | {label}")
+            axes[row, 0].set_title(f"{record['group'].upper()} | {record['role']}\n{label}")
             for column, layer in enumerate(layers, 1):
                 ax = axes[row, column]
                 panel = panels[row, column - 1]
@@ -164,7 +214,7 @@ def save_figure(image, maps, heads, layers, title, output, args):
         if args.scale == "shared":
             fig.colorbar(artist, ax=axes[:, 1:].ravel().tolist(), fraction=0.025,
                          pad=0.02, label="Attention probability (before overlay)")
-        fig.suptitle(title + "\nCLS query -> patch keys; no rollout")
+        fig.suptitle(title + "\n" + query_label)
         fig.savefig(output, dpi=150)
     finally:
         plt.close(fig)
@@ -174,56 +224,73 @@ def save_figure(image, maps, heads, layers, title, output, args):
 def main():
     args = parse_args()
     sources = image_sources(args)
-    samples = {group: select_images(paths, args.num_images, args.seed)
-               for group, paths in sources.items()}
+    pairs = select_pairs(sources, args.num_images, args.seed)
     checkpoint = trusted_load(args.checkpoint)
+    if checkpoint.get("identity_readout") == "group_roles":
+        raise ValueError("Grouping checkpoints have no CLS-to-patch maps; use tools/visualize_groups.py")
     output = Path(args.output_dir) / datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     output.mkdir(parents=True, exist_ok=False)
     report = {"args": vars(args), "checkpoint": str(Path(args.checkpoint).resolve()),
               "checkpoint_epoch": checkpoint.get("epoch"),
-              "checkpoint_step": checkpoint.get("global_step"), "images": [],
+              "checkpoint_step": checkpoint.get("global_step"), "pairs": [],
               "note": "Full unmasked RGB input; EXIF transpose, square bicubic resize, ImageNet normalization. "
                       "Raw softmax CLS-to-patch probabilities; no renormalization after dropping CLS key. "
-                      "Layers/heads are 1-based. Shared color scale is per image, not across images. "
-                      "Selection ignores validation ratio and does not imply paired Fake/Real samples."}
-    for role in dict.fromkeys((args.fake_role, args.real_role)):
-        model = encoder_from_checkpoint(checkpoint, args.device, role=role)
-        size = model.input_size
-        patch_size = model.backbone.patch_embed.patch_size
+                      "Layers/heads are 1-based. Shared color scale covers both images in each pair. "
+                      "Fake naming: target_id_source_id/target_stem_source_stem; "
+                      "Real is the exact Target original, matched by identity and image stem. "
+                      "Selection ignores validation ratio; there is no online synthesis."}
+    models, captures = {}, {}
+    try:
+        for role in dict.fromkeys((args.fake_role, args.real_role)):
+            models[role] = encoder_from_checkpoint(checkpoint, args.device, role=role)
+            captures[role] = AttentionCapture(models[role].backbone, args.layers, args.save_full_attention)
+        reference = models[args.fake_role]
+        size = reference.input_size
+        patch_size = reference.backbone.patch_embed.patch_size
         if size % patch_size:
             raise ValueError("Checkpoint input size must be divisible by patch size")
         grid = size // patch_size
-        heads = selected_heads(args.heads, model.backbone.blocks[0].attn.num_heads)
-        capture = AttentionCapture(model.backbone, args.layers, args.save_full_attention)
-        try:
+        heads = selected_heads(args.heads, reference.backbone.blocks[0].attn.num_heads)
+        for model in models.values():
+            if (model.input_size != size or model.backbone.patch_embed.patch_size != patch_size
+                    or model.backbone.blocks[0].attn.num_heads != reference.backbone.blocks[0].attn.num_heads):
+                raise ValueError("Paired visualizations require matching input size, patch size and head count")
+        for index, pair in enumerate(pairs, 1):
+            relative = (Path(f"target_{pair['target_id']}") / f"source_{pair['source_id']}"
+                        / f"pair_{index:04d}_{pair['fake'].stem}")
+            folder = output / relative
+            folder.mkdir(parents=True)
+            records, entries = [], {}
             for group in ("fake", "real"):
-                if getattr(args, f"{group}_role") != role:
-                    continue
-                folder = output / group
-                folder.mkdir()
-                for index, path in enumerate(samples[group], 1):
-                    with Image.open(path) as source:
-                        image = ImageOps.exif_transpose(source).convert("RGB").resize(
-                            (size, size), Image.Resampling.BICUBIC)
-                    tensor = TF.normalize(TF.to_tensor(image), MEAN, STD)
-                    capture.maps.clear()
-                    capture.matrices.clear()
-                    model(tensor.unsqueeze(0).to(args.device))
-                    maps = {layer: capture.maps[layer].reshape(-1, grid, grid)
-                            for layer in args.layers}
-                    name = f"{index:04d}_{path.stem}"
-                    save_figure(image, maps, heads, args.layers, f"{group.upper()} | {role} | {path.name}",
-                                folder / f"{name}.png", args)
-                    arrays = {f"layer_{layer}_cls_to_patch": value.numpy() for layer, value in maps.items()}
-                    arrays.update({f"layer_{layer}_full": value for layer, value in capture.matrices.items()})
-                    np.savez_compressed(folder / f"{name}.npz", **arrays)
-                    report["images"].append({"group": group, "role": role, "source": str(path),
-                                             "input_size": size, "grid_size": grid,
-                                             "figure": f"{group}/{name}.png", "weights": f"{group}/{name}.npz"})
-                    print(f"{group} {index}/{len(samples[group])}: {path}", flush=True)
-        finally:
+                path = pair[group]
+                role = getattr(args, f"{group}_role")
+                model, capture = models[role], captures[role]
+                with Image.open(path) as source:
+                    image = ImageOps.exif_transpose(source).convert("RGB").resize(
+                        (size, size), Image.Resampling.BICUBIC)
+                tensor = TF.normalize(TF.to_tensor(image), MEAN, STD)
+                capture.maps.clear()
+                capture.matrices.clear()
+                model(tensor.unsqueeze(0).to(args.device))
+                maps = {layer: capture.maps[layer].reshape(-1, grid, grid)
+                        for layer in args.layers}
+                records.append({"image": image, "maps": maps, "group": group, "role": role})
+                arrays = {f"layer_{layer}_cls_to_patch": value.numpy() for layer, value in maps.items()}
+                arrays.update({f"layer_{layer}_full": value for layer, value in capture.matrices.items()})
+                np.savez_compressed(folder / f"{group}.npz", **arrays)
+                entries[group] = {"source": str(path), "role": role,
+                                  "weights": (relative / f"{group}.npz").as_posix()}
+            title = (f"Target ID: {pair['target_id']} | Source ID: {pair['source_id']}\n"
+                     f"Fake: {pair['fake'].name} | Target Real: {pair['real'].name}")
+            save_figure(records, heads, args.layers, title, folder / "attention.png", args)
+            report["pairs"].append({"target_id": pair["target_id"], "source_id": pair["source_id"],
+                                    "input_size": size, "grid_size": grid,
+                                    "figure": (relative / "attention.png").as_posix(), **entries})
+            print(f"Pair {index}/{len(pairs)} | Target={pair['target_id']} Source={pair['source_id']} | "
+                  f"{pair['fake']} <-> {pair['real']}", flush=True)
+    finally:
+        for capture in captures.values():
             capture.close()
-        del model
     (output / "run.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Saved: {output.resolve()}", flush=True)
 

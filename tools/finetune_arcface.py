@@ -1,4 +1,4 @@
-"""Train full-image Fake and Real CLS features for target identity retrieval."""
+"""Train CLS target retrieval or GroupViT-style dual-identity retrieval."""
 
 import _bootstrap
 import argparse
@@ -23,7 +23,8 @@ from tqdm import tqdm
 
 from progressive.checkpoints import trusted_load
 from progressive.evaluation import RetrievalValidation, encoder_from_checkpoint
-from progressive.identity import ArcFace, Stage2
+from progressive.identity import ArcFace, Stage2, GroupStage2
+from progressive.grouping import GroupIdentityEncoder, GroupingBackbone
 from progressive.stage2_data import training_data
 
 
@@ -103,6 +104,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config")
     parser.add_argument("--checkpoint")
+    parser.add_argument("--student_arch", choices=["cls", "groupvit"], default="cls")
     parser.add_argument("--manifest")
     parser.add_argument("--data_root")
     parser.add_argument(
@@ -179,6 +181,9 @@ def build_model(args, device, num_classes):
     student = encoder_from_checkpoint(checkpoint, device, role="student").requires_grad_(True)
     real_encoder = encoder_from_checkpoint(checkpoint, device, role="teacher")
     student.input_size = real_encoder.input_size = 224
+    if args.student_arch == "groupvit":
+        student = GroupIdentityEncoder(GroupingBackbone(student.backbone)).to(device)
+        logging.info("Grouping student: blocks 1-4/5-8/9-12; 196 -> 64 -> 16 -> 2 (Target, Source)")
     real_encoder.backbone.blocks[-2:].requires_grad_(True)
     real_encoder.backbone.norm.requires_grad_(True)
     head = ArcFace(student.embed_dim, num_classes).to(device)
@@ -189,7 +194,8 @@ def build_model(args, device, num_classes):
         and torch.cuda.is_bf16_supported()
     )
     logging.info("Encoder precision: %s; losses use FP32", "BF16 autocast" if use_bf16 else "FP32")
-    return Stage2(student, real_encoder, head, use_bf16)
+    stage = GroupStage2 if args.student_arch == "groupvit" else Stage2
+    return stage(student, real_encoder, head, use_bf16)
 
 
 def build_optimizer(model, args):
@@ -224,7 +230,7 @@ def build_optimizer(model, args):
 
 def save_checkpoint(model, identities, args, path, epoch, step, metrics):
     state = {
-        "identity_readout": "cls",
+        "identity_readout": "group_roles" if args.student_arch == "groupvit" else "cls",
         "input_size": model.student.input_size,
         "encoder": model.student.backbone.state_dict(),
         "real_encoder": model.real_encoder.backbone.state_dict(),
@@ -328,15 +334,16 @@ def main():
     student, real_encoder = stage2.student, stage2.real_encoder
     total_steps = len(loader) * args.epochs
     save = partial(save_checkpoint, stage2, dataset.classes, args)
-
     best_top1 = -1.0
     latest_validation = None
+    loss_names = (("fake_target", "fake_source", "real_target", "real_source", "align_target", "align_source")
+                  if args.student_arch == "groupvit" else ("fake", "real", "alignment"))
     training_started = time.monotonic()
     for epoch in range(args.epochs):
         if sampler is not None and epoch:
             sampler.set_epoch(epoch)
         stage2.train()
-        totals = torch.zeros(4, device=device) if is_main else None
+        totals = torch.zeros(1 + len(loss_names), device=device) if is_main else None
         samples = interval_images = interval_steps = 0
         loader_wait = 0.0
         interval_start = wait_started = time.monotonic()
@@ -347,7 +354,8 @@ def main():
             desc=f"Epoch {epoch + 1}/{args.epochs}",
             disable=not is_main,
         )
-        for step, (fake, real, labels) in enumerate(batches, 1):
+        for step, batch in enumerate(batches, 1):
+            batch_size = len(batch[0])
             global_step = epoch * len(loader) + step
             if is_main:
                 loader_wait += time.monotonic() - wait_started
@@ -362,7 +370,13 @@ def main():
             )
             for group in optimizer.param_groups:
                 group["lr"] = group["peak_lr"] * factor
-            fake_loss, real_loss, alignment = model(fake, real, labels)
+            components = model(*batch)
+            if args.student_arch == "groupvit":
+                fake_loss = (components[0] + components[1]) / 2
+                real_loss = (components[2] + components[3]) / 2
+                alignment = (components[4] + components[5]) / 2
+            else:
+                fake_loss, real_loss, alignment = components
             loss = (
                 args.fake_weight * fake_loss
                 + args.real_weight * real_loss
@@ -373,22 +387,22 @@ def main():
             if is_main:
                 totals.add_(
                     torch.stack(
-                        [loss.detach(), fake_loss.detach(), real_loss.detach(), alignment.detach()]
+                        [loss.detach(), *(value.detach() for value in components)]
                     ),
-                    alpha=len(labels),
+                    alpha=batch_size,
                 )
-            samples += len(labels)
-            interval_images += len(labels)
+            samples += batch_size
+            interval_images += batch_size
             interval_steps += 1
             if is_main and (step == 1 or global_step % args.verbose == 0 or step == len(loader)):
                 mean_losses = (totals / samples).tolist()
                 elapsed = time.monotonic() - interval_start
                 logging.info(
-                    "Speed %.2f pairs/sec   Loss %.4f (Fake: %.4f, Real: %.4f, Align: %.4f)   "
+                    "Speed %.2f fakes/sec   Loss %.4f   Components %s   "
                     "LearningRate %.8g   Epoch: %d/%d   Global Step: %d/%d   "
                     "Loader wait: %.1fs   Elapsed: %.1fs   ETA: %.1f min",
                     interval_images * world_size / max(elapsed, 1e-6),
-                    *mean_losses,
+                    mean_losses[0], dict(zip(loss_names, mean_losses[1:])),
                     optimizer.param_groups[0]["lr"],
                     epoch + 1,
                     args.epochs,
@@ -417,6 +431,7 @@ def main():
                         min(args.batch_size, 64),
                         0 if distributed else args.num_workers,
                         image_size=real_encoder.input_size,
+                        include_source=args.student_arch == "groupvit",
                     )
                     logging.info(
                         "Validation image selection took %.1fs",
@@ -426,7 +441,7 @@ def main():
                 metrics = validation.evaluate(student.eval(), real_encoder.eval(), device)
                 latest_validation = {"step": global_step, **metrics}
                 for name, scores in metrics.items():
-                    label = "fake" if name == "fake" else "ori"
+                    label = {"fake": "fake_target", "fake_source": "fake_source", "real": "ori"}[name]
                     logging.info(
                         "Step %d validation: %s Accuracy (Top-1): %.2f%%  Top-5: %.2f%%  MRR: %.4f",
                         global_step,
@@ -464,10 +479,10 @@ def main():
             wait_started = time.monotonic()
         if is_main:
             logging.info(
-                "Epoch %d/%d summary: loss=%.4f fake=%.4f real=%.4f alignment=%.4f",
+                "Epoch %d/%d summary: loss=%.4f components=%s",
                 epoch + 1,
                 args.epochs,
-                *mean_losses,
+                mean_losses[0], dict(zip(loss_names, mean_losses[1:])),
             )
             if (epoch + 1) % 5 == 0:
                 snapshot = output.with_name(f"{output.stem}_epoch{epoch + 1:02d}{output.suffix}")
