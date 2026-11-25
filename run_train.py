@@ -59,6 +59,10 @@ TRAINING_DEFAULTS = {
     'dist_url': 'env://',
     'local_rank': 0,
     'verbose': 2000,
+    'mask_mode': 'progressive',
+    'identity_weight': 0.0,
+    'arcface_margin': 0.5,
+    'arcface_scale': 64.0,
 }
 
 # Older project configs can contain these unused upstream options.
@@ -75,10 +79,10 @@ def read_stage1_config(path=DEFAULT_STAGE1_CONFIG, overrides=None):
     return config
 
 
-def parse_config():
+def parse_config(default_config=DEFAULT_STAGE1_CONFIG):
     cli = argparse.ArgumentParser()
-    cli.add_argument('--config', default=str(DEFAULT_STAGE1_CONFIG))
-    for name in ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir', 'packed_mask_dir'):
+    cli.add_argument('--config', default=str(default_config))
+    for name in ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir', 'packed_mask_dir', 'blendface_masks'):
         cli.add_argument('--' + name)
     cli.add_argument('--batch_size_per_gpu', type=int)
     cli.add_argument('--num_workers', type=int)
@@ -88,12 +92,14 @@ def parse_config():
     cli.add_argument('--local-rank', '--local_rank', type=int, default=0)
     parsed = cli.parse_args()
     keys = ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir',
-            'batch_size_per_gpu', 'num_workers', 'lr', 'verbose', 'packed_mask_dir')
+            'batch_size_per_gpu', 'num_workers', 'lr', 'verbose', 'packed_mask_dir', 'blendface_masks')
     overrides = {name: getattr(parsed, name) for name in keys}
     if parsed.resume and parsed.pretrained is None:
         overrides['pretrained'] = ''
     config = read_stage1_config(parsed.config, overrides)
-    required = ('data_path', 'parsing_root') + (('resume',) if config.get('resume') else ('pretrained',))
+    identity = config.get('identity_weight', 0) > 0
+    required = ('data_path',) + (() if identity else ('parsing_root',))
+    required += ('resume',) if config.get('resume') else ('pretrained',)
     missing = [k for k in required if not config.get(k) or not Path(config[k]).exists()]
     if missing:
         if 'pretrained' in missing:
@@ -110,18 +116,40 @@ def parse_config():
     data_root = Path(config['data_path'])
     if not all((data_root / name).is_file() for name in ('train.idx', 'train.rec')):
         cli.error('data_path must contain MS1Mv3 train.idx and train.rec')
-    cache_root = Path(config['parsing_root'])
-    packed_root = Path(config['packed_mask_dir']) if config.get('packed_mask_dir') else cache_root / 'packed-masks'
-    required_cache = [cache_root / 'index.json', cache_root / 'valid-records.npy',
-                      packed_root / 'progress.json', packed_root / 'masks.npy']
+    if identity:
+        unused = set(config) & {'parsing_root', 'packed_mask_dir'}
+        if unused:
+            cli.error('Identity training no longer uses stage1 index/mask paths; remove: ' + ', '.join(sorted(unused)))
+        if not config.get('blendface_masks'):
+            cli.error('Identity experiment requires blendface_masks pointing to masks_packed')
+        blend_masks = Path(config['blendface_masks'])
+        required_cache = [data_root / 'idx2label.json', blend_masks / 'meta.pkl', blend_masks / 'bits.npy']
+    else:
+        cache_root = Path(config['parsing_root'])
+        packed_root = Path(config['packed_mask_dir']) if config.get('packed_mask_dir') else cache_root / 'packed-masks'
+        required_cache = [cache_root / 'index.json', cache_root / 'valid-records.npy',
+                          packed_root / 'progress.json', packed_root / 'masks.npy']
     missing_cache = [str(path) for path in required_cache if not path.is_file()]
     if missing_cache:
-        cli.error('Run tools/prepare_ms1mv3.py, then the same command with --pack_masks. Missing: '
-                  + ', '.join(missing_cache))
-    from progressive.masking import ProgressiveCRFRPMask
-    generator = ProgressiveCRFRPMask(config['stages'], config['patch_size'])
-    if config['epochs'] != generator.stages[-1].end_epoch:
-        raise SystemExit('epochs must equal final stage end_epoch')
+        cli.error('Missing data/index files: ' + ', '.join(missing_cache))
+    if config.get('mask_mode', 'progressive') not in ('progressive', 'inner'):
+        cli.error('mask_mode must be progressive or inner')
+    if identity:
+        if (config.get('mask_mode') != 'inner' or config.get('visible_decoder', False)
+                or config.get('local_crops_number', 0) != 0
+                or config.get('global_crops_number', 2) != 2
+                or config.get('require_full_organs', True)
+                or list(config.get('global_crops_scale', (1, 1))) != [1, 1]):
+            cli.error('Identity experiment requires binary BlendFace inner mask, require_full_organs=false, original iBOT, two full global views and no local views')
+        if config.get('stages'):
+            cli.error('Identity experiment does not use a progressive schedule')
+    else:
+        if config.get('mask_mode', 'progressive') != 'progressive':
+            cli.error('inner mask is reserved for the identity experiment')
+        from progressive.masking import ProgressiveCRFRPMask
+        generator = ProgressiveCRFRPMask(config['stages'], config['patch_size'])
+        if config['epochs'] != generator.stages[-1].end_epoch:
+            raise SystemExit('epochs must equal final stage end_epoch')
     if config['pred_start_epoch'] != 0 or config['lambda1'] != 1 or config['lambda2'] != 1:
         raise SystemExit('Keep original CLS + MIM active with unit weights for this experiment')
     if config.get('visible_decoder'):

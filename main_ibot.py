@@ -32,6 +32,42 @@ from progressive.checkpoints import (read_initial_checkpoint, load_models, load_
                                      restore_experiment, capture_rng)
 from progressive.visible_decoder import VisiblePatchStudent
 from progressive.recordio import GlobalCropValidator, RecordIOFaceMaskDataset
+from progressive.recordio import RecordIOIdentityMaskDataset
+from progressive.identity_ibot import IdentityStudent
+
+
+def training_loader(args, start_epoch):
+    """Start CPU workers before CUDA/NCCL and reuse them across epochs."""
+    rank = int(os.environ.get('RANK', os.environ.get('SLURM_PROCID', 0)))
+    world = int(os.environ.get('WORLD_SIZE', os.environ.get('SLURM_NTASKS', 1)))
+    identity = args.identity_weight > 0
+    transform = PairedFaceAugmentation(
+        args.global_crops_scale, args.local_crops_scale,
+        args.global_crops_number, args.local_crops_number, args.require_full_organs,
+        crop_validator=None if identity else GlobalCropValidator(args.patch_size, .75))
+    if identity:
+        dataset = RecordIOIdentityMaskDataset(
+            args.data_path, args.blendface_masks,
+            args.patch_size, transform, args.seed)
+    else:
+        dataset = RecordIOFaceMaskDataset(
+            args.data_path, args.parsing_root, args.stages, args.patch_size,
+            transform, args.seed, getattr(args, 'packed_mask_dir', None))
+    dataset.set_epoch(start_epoch)
+    sampler = torch.utils.data.DistributedSampler(
+        dataset, num_replicas=world, rank=rank, seed=args.seed if identity else 0, shuffle=True)
+    sampler.set_epoch(start_epoch)
+    context = ('fork' if sys.platform.startswith('linux') else 'spawn') if args.num_workers else None
+    loader = torch.utils.data.DataLoader(
+        dataset, sampler=sampler, batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers, multiprocessing_context=context,
+        persistent_workers=bool(args.num_workers), pin_memory=False, drop_last=False)
+    started = time.monotonic()
+    first_batches = iter(loader) if args.num_workers else None
+    if rank == 0:
+        print(f'DataLoader started: {args.num_workers} workers/rank ({context}), '
+              f'{time.monotonic() - started:.1f}s; persistent={bool(args.num_workers)}', flush=True)
+    return loader, first_batches
 
 
 class ProgressConsoleHandler(logging.StreamHandler):
@@ -62,6 +98,16 @@ def train_ibot(args):
         warnings.filterwarnings('ignore', message=rf'`{api.replace(".", "[.]")}(?:\([^`]*\))?` is deprecated',
                                 category=FutureWarning)
     initial_checkpoint = read_initial_checkpoint(args)
+    data_loader, first_batches = training_loader(
+        args, initial_checkpoint['epoch'] if args.resume else 0)
+    dataset = data_loader.dataset
+    identity = args.identity_weight > 0
+    if identity:
+        args.num_classes = len(dataset.classes)
+        args.num_images = len(dataset)
+        args.recordio_signature = dataset.source
+        if args.resume and not np.array_equal(initial_checkpoint['identity_classes'], dataset.classes):
+            raise ValueError('Resume identity class order differs from the current label index')
     utils.init_distributed_mode(args)
     output_dir = [None]
     if utils.is_main_process():
@@ -93,27 +139,11 @@ def train_ibot(args):
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
-    transform = PairedFaceAugmentation(
-        args.global_crops_scale, args.local_crops_scale,
-        args.global_crops_number, args.local_crops_number,
-        args.require_full_organs,
-        crop_validator=GlobalCropValidator(args.patch_size, .75))
-    dataset = RecordIOFaceMaskDataset(
-        args.data_path, args.parsing_root, args.stages, args.patch_size,
-        transform, args.seed, getattr(args, 'packed_mask_dir', None))
-    logger.info('Packed masks: %s', dataset.packed_mask_path)
+    logger.info('Mask data: %s', args.blendface_masks if identity else dataset.packed_mask_path)
     logger.debug('RecordIO counts: %s', dataset.counts)
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        sampler=sampler,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
-        # Workers start after NCCL initialization, so avoid inheriting it via fork.
-        multiprocessing_context='spawn' if args.num_workers > 0 else None,
-        pin_memory=True,
-        drop_last=False,
-    )
+    if identity:
+        logger.info('Identity classes: %d; CLS + Patch + %g * ArcFace; fixed BlendFace mask',
+                    args.num_classes, args.identity_weight)
     if len(data_loader) == 0:
         raise ValueError("Dataset is smaller than one distributed batch; reduce batch size")
     batch_global = args.batch_size_per_gpu * utils.get_world_size()
@@ -134,7 +164,8 @@ def train_ibot(args):
     embed_dim = student.embed_dim
 
     # multi-crop wrapper handles forward with inputs of different resolutions
-    student_wrapper = VisiblePatchStudent if args.visible_decoder else utils.MultiCropWrapper
+    student_wrapper = (IdentityStudent if identity else
+                       VisiblePatchStudent if args.visible_decoder else utils.MultiCropWrapper)
     student = student_wrapper(student, iBOTHead(
         embed_dim,
         args.out_dim,
@@ -157,6 +188,8 @@ def train_ibot(args):
     )
     if args.visible_decoder:
         student.add_decoder(args.decoder_depth, args.decoder_width)
+    if identity:
+        student.add_classifier(args.num_classes, args.arcface_margin, args.arcface_scale)
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -173,7 +206,8 @@ def train_ibot(args):
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
     # Preserve the separately pretrained student and EMA teacher, including heads.
     load_models(initial_checkpoint, student.module, teacher_without_ddp,
-                initialize_decoder=args.visible_decoder and not args.resume)
+                initialize_decoder=args.visible_decoder and not args.resume,
+                initialize_identity=identity and not args.resume)
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
@@ -230,7 +264,8 @@ def train_ibot(args):
         # Stage 0 is the loaded pretrained pair, without old optimizer/epoch state.
         utils.save_on_master({'student': student.state_dict(), 'teacher': teacher.state_dict(),
                               'args': args, 'epoch': 0, 'ibot_loss': ibot_loss.state_dict(),
-                              'experiment': 'progressive-crfrp-stage0',
+                              'experiment': 'ibot-identity-stage0' if identity else 'progressive-crfrp-stage0',
+                              **({'identity_classes': dataset.classes} if identity else {}),
                               'pretrained_source': args.pretrained},
                              os.path.join(args.output_dir, 'stage0.pth'))
     del initial_checkpoint
@@ -244,7 +279,8 @@ def train_ibot(args):
         # ============ training one epoch of iBOT ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss,
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, args)
+            epoch, fp16_scaler, args, first_batches)
+        first_batches = None
 
         # ============ writing logs ... ============
         save_dict = {
@@ -254,7 +290,8 @@ def train_ibot(args):
             'epoch': epoch + 1,
             'args': args,
             'ibot_loss': ibot_loss.state_dict(),
-            'experiment': 'progressive-crfrp-v1',
+            'experiment': 'ibot-identity-v1' if identity else 'progressive-crfrp-v1',
+            **({'identity_classes': dataset.classes} if identity else {}),
             'rng_states': capture_rng(),
         }
         if fp16_scaler is not None:
@@ -263,7 +300,7 @@ def train_ibot(args):
         for stage_index, stage in enumerate(args.stages, 1):
             if epoch + 1 == stage['end_epoch']:
                 utils.save_on_master(save_dict, os.path.join(args.output_dir, f'stage{stage_index}.pth'))
-        if args.saveckp_freq and (epoch % args.saveckp_freq == 0) and epoch:
+        if args.saveckp_freq and (epoch + 1) % args.saveckp_freq == 0:
             utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
@@ -278,29 +315,33 @@ def train_ibot(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time %s', total_time_str)
+    if utils.is_main_process():
+        writer.close()
 
 
-def cuda_batches(data_loader):
+def cuda_batches(data_loader, iterator=None):
     device = torch.cuda.current_device()
     logger = logging.getLogger('ibot.training')
 
     def move_batch(batch):
         images, labels, masks, mask_stats = batch
-        return ([image.to(device=device, non_blocking=True) for image in images], labels,
-                [mask.to(device=device, non_blocking=True) for mask in masks], mask_stats)
+        def copy(tensor):
+            return tensor.pin_memory().to(device=device, non_blocking=True)
+        return ([copy(image) for image in images], copy(labels),
+                [copy(mask) for mask in masks], mask_stats)
 
     # Without workers, data augmentation runs in this process and uses its RNG.
     if data_loader.num_workers == 0 or os.environ.get('IBOT_DISABLE_CUDA_PREFETCH') == '1':
         logger.info('Loading batches on the training thread with %d DataLoader workers',
                     data_loader.num_workers)
-        for batch_index, batch in enumerate(data_loader):
+        for batch_index, batch in enumerate(iterator if iterator is not None else data_loader):
             if batch_index == 0:
                 logger.info('First CPU batch ready on the training thread')
             yield move_batch(batch)
         return
 
     logger.info('Initializing DataLoader with %d workers', data_loader.num_workers)
-    loader_iterator = iter(data_loader)
+    loader_iterator = iterator if iterator is not None else iter(data_loader)
     copy_stream = torch.cuda.Stream(device=device)
     compute_stream = torch.cuda.current_stream(device)
 
@@ -322,8 +363,8 @@ def cuda_batches(data_loader):
         pending = prefetch.submit(load_next, first_batch=True)
         while (batch := pending.result()) is not None:
             compute_stream.wait_stream(copy_stream)
-            images, _, masks, _ = batch
-            for tensor in images + masks:
+            images, labels, masks, _ = batch
+            for tensor in images + masks + [labels]:
                 tensor.record_stream(compute_stream)
             pending = prefetch.submit(load_next)
             yield batch
@@ -331,17 +372,17 @@ def cuda_batches(data_loader):
 
 def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
-                    fp16_scaler, args):
+                    fp16_scaler, args, first_batches=None):
     metric_logger = utils.MetricLogger(delimiter="  ")
     logger = logging.getLogger('ibot.training')
     interval_start = None
     interval_steps = interval_images = 0
     steps = len(data_loader)
-    progress = tqdm(cuda_batches(data_loader), total=steps, desc=f'Epoch {epoch + 1}/{args.epochs}',
+    progress = tqdm(cuda_batches(data_loader, first_batches), total=steps, desc=f'Epoch {epoch + 1}/{args.epochs}',
                     file=sys.stdout, dynamic_ncols=True,
                     disable=not (utils.is_main_process() and sys.stdout.isatty()))
     
-    for batch_index, (images, _, masks, mask_stats) in enumerate(progress, 1):
+    for batch_index, (images, labels, masks, mask_stats) in enumerate(progress, 1):
         audit_overflows(mask_stats, data_loader.dataset, args.output_dir, epoch, utils.get_rank())
         # update weight decay and learning rate according to their schedule
         it = steps * epoch + batch_index - 1
@@ -352,8 +393,13 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
 
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             # get global views
-            teacher_output = teacher(images[:args.global_crops_number])
-            student_output = student(images[:args.global_crops_number], mask=masks[:args.global_crops_number])
+            with torch.no_grad():
+                teacher_output = teacher(images[:args.global_crops_number])
+            if args.identity_weight > 0:
+                student_output, identity_loss, identity_acc = student(
+                    images[:args.global_crops_number], mask=masks[:args.global_crops_number], labels=labels)
+            else:
+                student_output = student(images[:args.global_crops_number], mask=masks[:args.global_crops_number])
             
             # get local views
             student.module.backbone.masked_im_modeling = False
@@ -362,6 +408,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
 
             all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch)
             loss = all_loss.pop('loss')
+            if args.identity_weight > 0:
+                loss = loss + args.identity_weight * identity_loss
+                all_loss.update(identity=identity_loss, identity_acc=identity_acc)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -412,6 +461,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             logger.info('Epoch: %d/%d  Global Step: %d  Loss %.4f (CLS %.4f, Patch %.4f)',
                         epoch + 1, args.epochs, it + 1, loss.item(),
                         all_loss['cls'].item(), all_loss['patch'].item())
+            if args.identity_weight > 0:
+                logger.info('ArcFace %.4f; masked identity train accuracy %.2f%%',
+                            identity_loss.item(), 100 * identity_acc.item())
             interval_start = time.monotonic()
             continue
         interval_steps += 1
@@ -429,6 +481,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
                         interval_images / max(elapsed, 1e-6), meters['loss'].avg,
                         meters['cls'].avg, meters['patch'].avg, optimizer.param_groups[0]['lr'],
                         epoch + 1, args.epochs, it + 1, fp16_text, remaining_hours)
+            if args.identity_weight > 0:
+                logger.info('ArcFace %.4f; masked identity train accuracy %.2f%%',
+                            meters['identity'].avg, 100 * meters['identity_acc'].avg)
             interval_start = time.monotonic()
             interval_steps = interval_images = 0
 

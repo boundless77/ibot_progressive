@@ -1,6 +1,7 @@
 """Visualize actual per-layer ViT CLS attention on Fake and Real images.
 
 Run from ibot_progressive. Pair pre-generated Fake images with exact Target originals.
+By default, Fake uses the student and Real uses the teacher/Real encoder.
 No training, masking, gradients, attention rollout, or face alignment is applied.
 """
 
@@ -43,8 +44,10 @@ def parse_args(model="ibot"):
     parser.add_argument("--heads", nargs="+", default=["mean"],
                         help="mean, all (mean plus every head), or 1-based head numbers")
     if model == "ibot":
-        parser.add_argument("--fake_role", choices=["student", "teacher"], default="student")
-        parser.add_argument("--real_role", choices=["student", "teacher"], default="student")
+        parser.add_argument("--fake_role", choices=["student", "teacher"], default="student",
+                            help="Encoder for Fake images (default: student)")
+        parser.add_argument("--real_role", choices=["student", "teacher"], default="teacher",
+                            help="Encoder for Target Real images (default: teacher/Real encoder)")
     else:
         parser.add_argument("--tokens", nargs="+", choices=["inner", "outer"], default=["inner", "outer"])
     parser.add_argument("--image_alpha", type=float, default=0.35,
@@ -226,8 +229,6 @@ def main():
     sources = image_sources(args)
     pairs = select_pairs(sources, args.num_images, args.seed)
     checkpoint = trusted_load(args.checkpoint)
-    if checkpoint.get("identity_readout") == "group_roles":
-        raise ValueError("Grouping checkpoints have no CLS-to-patch maps; use tools/visualize_groups.py")
     output = Path(args.output_dir) / datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     output.mkdir(parents=True, exist_ok=False)
     report = {"args": vars(args), "checkpoint": str(Path(args.checkpoint).resolve()),

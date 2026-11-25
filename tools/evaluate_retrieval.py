@@ -1,4 +1,8 @@
-"""Compare Stage 0..3 on a common gallery/query manifest and occlusion bank."""
+"""Full-image CLS retrieval: teacher gallery/Real queries, student Fake queries.
+
+Legacy Stage 0..3 and Fake/Real checkpoints remain supported. Additional RGB
+occlusions run only when explicitly selected with --modes.
+"""
 
 import _bootstrap
 import argparse
@@ -149,16 +153,19 @@ def main():
             raise ValueError("Fake Target and Source must be different")
     report = {
         "manifest_sha256": hashlib.sha256(raw).hexdigest(),
-        "note": "Full-image CLS retrieval: Real encoder for gallery/Real queries, Student for Fake queries.",
+        "note": "Default: full images, no token masking. Teacher/Real encoder builds the gallery and encodes Real queries; Student encodes Fake queries for identity and legacy Fake/Real checkpoints.",
         "checkpoints": {},
     }
     for checkpoint in args.checkpoints:
         logging.info("Checkpoint: %s", checkpoint)
         state = trusted_load(checkpoint)
-        model = encoder_from_checkpoint(state, args.device)
+        identity_checkpoint = state.get('experiment', '').startswith('ibot-identity')
+        logging.info("Encoder policy: Teacher/Real for gallery and Real queries; %s for Fake queries; no token masking",
+                     "Student" if identity_checkpoint or "real_encoder" in state else "Teacher (legacy stage1 diagnostic)")
+        model = encoder_from_checkpoint(state, args.device, role="teacher")
         fake_model = (
             encoder_from_checkpoint(state, args.device, role="student")
-            if "real_encoder" in state
+            if identity_checkpoint or "real_encoder" in state
             else None
         )
         del state

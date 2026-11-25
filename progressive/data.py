@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 from torchvision.transforms import functional as TF, InterpolationMode as IM
-from .masking import ProgressiveCRFRPMask, ORGANS
+from .masking import ProgressiveCRFRPMask, InnerFaceMask, ORGANS
 
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
@@ -81,26 +81,38 @@ class PairedFaceAugmentation:
 class FaceMaskDataset(Dataset):
     """Common augmentation and mask generation for RecordIO samples."""
 
-    def __init__(self, stages, patch_size, augmentation, seed=0):
-        self.generator = ProgressiveCRFRPMask(stages, patch_size)
+    def __init__(self, stages, patch_size, augmentation, seed=0, mask_mode='progressive'):
+        self.generator = (InnerFaceMask(patch_size) if mask_mode == 'inner'
+                          else ProgressiveCRFRPMask(stages, patch_size))
         self.strict_budget = True
-        self.augmentation, self.seed, self.epoch = augmentation, seed, 0
+        self.augmentation, self.seed = augmentation, seed
+        # Persistent workers share the epoch rather than keeping a stale local copy.
+        self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
+
+    @property
+    def epoch(self):
+        return int(self._epoch.item())
 
     def set_epoch(self, epoch):
-        self.epoch = epoch
+        self._epoch.fill_(epoch)
 
     def make_sample(self, index, image, labels):
         # Per-index/epoch seed is independent of worker scheduling and resume.
         seed = int.from_bytes(hashlib.sha256(('%d:%d:%d' % (self.seed, self.epoch, index)).encode()).digest()[:8], 'little')
         rng = np.random.default_rng(seed)
-        py_state, torch_state = random.getstate(), torch.random.get_rng_state()
+        # Worker RNG is private; only the zero-worker path must restore the
+        # training process RNG. Seed CPU directly without touching CUDA APIs.
+        restore_rng = torch.utils.data.get_worker_info() is None
+        if restore_rng:
+            py_state, torch_state = random.getstate(), torch.random.get_rng_state()
         try:
             random.seed(seed)
-            torch.manual_seed(seed)
+            torch.random.default_generator.manual_seed(seed)
             views, maps, geometry = self.augmentation(image, labels)
         finally:
-            random.setstate(py_state)
-            torch.random.set_rng_state(torch_state)
+            if restore_rng:
+                random.setstate(py_state)
+                torch.random.set_rng_state(torch_state)
         masks, stats = [], []
         for v, sem in enumerate(maps):
             if v < self.augmentation.global_count:
@@ -118,7 +130,8 @@ class FaceMaskDataset(Dataset):
             masks.append(mask)
         metrics = {k: float(np.mean([s[k] for s in stats])) for k in
                    ('actual_ratio', 'forced_ratio', 'overflow', 'crop_fallback')}
-        metrics['stage'] = stats[0]['stage']
+        if isinstance(self.generator, ProgressiveCRFRPMask):
+            metrics['stage'] = stats[0]['stage']
         # Keep per-view information for auditing samples that exceed their budget.
         metrics.update(_index=index,
                        _actual=np.array([s['actual_ratio'] for s in stats]),

@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import pickle
 import struct
 from pathlib import Path
 
@@ -11,6 +12,34 @@ from PIL import Image
 
 from .data import FaceMaskDataset
 from .masking import ORGANS, ProgressiveCRFRPMask
+
+
+class PackedMasks:
+    def __init__(self, root):
+        root = Path(root)
+        with (root / "meta.pkl").open("rb") as handle:
+            meta = pickle.load(handle)
+        self.keys = meta["keys"]
+        self.stride = meta["key_stride"]
+        self.shape = (meta["height"], meta["width"])
+        self.bits_path = root / "bits.npy"
+        self.bits = None
+
+    def __getstate__(self):
+        return dict(self.__dict__, bits=None)
+
+    def get(self, label, image_id):
+        key = label * self.stride + image_id
+        position = np.searchsorted(self.keys, key)
+        if position == len(self.keys) or self.keys[position] != key:
+            raise KeyError(f"Packed mask missing for identity {label}, image {image_id}")
+        if self.bits is None:
+            self.bits = np.load(self.bits_path, mmap_mode="r")
+        return (
+            np.unpackbits(self.bits[position], count=self.shape[0] * self.shape[1])
+            .reshape(self.shape)
+            .astype(np.float32)
+        )
 
 
 def open_recordio(root):
@@ -137,3 +166,55 @@ class RecordIOFaceMaskDataset(FaceMaskDataset):
         if labels.shape != (image.height, image.width):
             raise ValueError(f'Record {record_id}: packed mask size differs from RecordIO image')
         return self.make_sample(index, image, Image.fromarray(labels))
+
+
+class RecordIOIdentityMaskDataset(FaceMaskDataset):
+    """All RecordIO images with existing identity labels and BlendFace binary masks."""
+
+    def __init__(self, data_root, blend_masks, patch_size, augmentation, seed):
+        super().__init__([], patch_size, augmentation, seed, mask_mode='inner')
+        self.data_root = Path(data_root)
+        self.source = source_signature(self.data_root)
+        # Only inspect the RecordIO image range here, not image contents.
+        reader = open_recordio(self.data_root)
+        try:
+            self.indices = image_indices(reader)
+        finally:
+            reader.close()
+        self.size = len(self.indices)
+        if not self.size:
+            raise ValueError('RecordIO contains no image records')
+        # This is the existing BlendFace label metadata, not a new generated index.
+        with (self.data_root / 'idx2label.json').open('rb') as handle:
+            labels = pickle.load(handle)
+        self.classes = np.unique(np.fromiter(
+            (int(labels[int(record)]) for record in self.indices), dtype=np.int64, count=self.size))
+        if len(self.classes) < 2:
+            raise ValueError('Identity training needs at least two identities')
+        self.class_index = {int(label): cls for cls, label in enumerate(self.classes)}
+        self.counts = dict(total=self.size, train=self.size)
+        self.masks = PackedMasks(blend_masks)
+        self.reader = self.reader_pid = None
+
+    def __len__(self):
+        return self.size
+
+    def __getstate__(self):
+        return dict(self.__dict__, reader=None, reader_pid=None)
+
+    def sample_name(self, index):
+        return f'MS1Mv3 record {int(self.indices[index])}'
+
+    def __getitem__(self, index):
+        if self.reader_pid != os.getpid():
+            self.reader = open_recordio(self.data_root)
+            self.reader_pid = os.getpid()
+        record = int(self.indices[index])
+        label, image_id, image = read_record_with_id(self.reader, record)
+        if label not in self.class_index:
+            raise ValueError(f'Record {record}: identity {label} missing from idx2label.json')
+        mask = self.masks.get(label, image_id)
+        if mask.shape != (image.height, image.width):
+            raise ValueError(f'Record {record}: BlendFace mask and image sizes differ')
+        views, _, masks, stats = self.make_sample(index, image, Image.fromarray(mask.astype(np.uint8)))
+        return views, self.class_index[label], masks, stats

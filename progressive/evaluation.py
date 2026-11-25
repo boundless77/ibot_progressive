@@ -31,6 +31,8 @@ def load_full_role(checkpoint_path, device='cpu', role='teacher'):
     import utils
     from models.head import iBOTHead
     checkpoint=trusted_load(checkpoint_path)
+    if checkpoint.get('experiment', '').startswith('ibot-identity'):
+        raise ValueError('This legacy patch diagnostic uses stage1 semantic masks; use tools/evaluate_retrieval.py for identity retrieval')
     config=checkpoint['args']; config=vars(config) if not isinstance(config,dict) else config
     if config['arch']!='vit_base' or config['patch_size']!=16:
         raise ValueError('Patch diagnostics require ViT-B/16')
@@ -55,31 +57,30 @@ def load_encoder(checkpoint_path, device='cpu', role='teacher'):
 
 
 def encoder_from_checkpoint(ckpt, device='cpu', role='teacher'):
-    """Load a Stage 1 backbone or a Stage 2 CLS/group identity encoder."""
+    """Load the Real/teacher encoder by default; Fake queries select student."""
     import models
+    identity_checkpoint = ckpt.get('experiment', '').startswith('ibot-identity')
     if role not in ('student', 'teacher'):
         raise ValueError('Identity encoder role must be student or teacher')
-    if (ckpt.get('identity_readout') not in (None, 'cls', 'group_roles')
+    if (ckpt.get('identity_readout') not in (None, 'cls')
             or ckpt.get('fake_preprocess') not in (None, 'none')
             or any(key in ckpt for key in ('predictor', 'face_parser', 'identity_projection'))):
         raise ValueError('This CLS baseline cannot evaluate checkpoints from other readout/preprocessing experiments')
     args = ckpt['args']; args = vars(args) if not isinstance(args, dict) else args
     if args['arch'] != 'vit_base' or args['patch_size'] != 16:
         raise ValueError('Evaluation expects ViT-B/16')
-    model = models.vit_base(patch_size=16, return_all_tokens=True)
-    if ckpt.get('identity_readout') == 'group_roles' and role == 'student':
-        from .grouping import GroupIdentityEncoder, GroupingBackbone
-        model = GroupingBackbone(model)
-        model.load_state_dict(ckpt['encoder'], strict=True)
-        model = GroupIdentityEncoder(model, input_size=ckpt.get('input_size', 224))
-        return model.to(device).eval().requires_grad_(False)
+    keep_mask_token = identity_checkpoint and role == 'student'
+    # Retain the learned parameter when loading, but mask=None leaves every
+    # image patch untouched during normal retrieval.
+    model = models.vit_base(patch_size=16, return_all_tokens=True, masked_im_modeling=keep_mask_token)
     if 'real_encoder' in ckpt:
         state = ckpt['real_encoder' if role == 'teacher' else 'encoder']
     else:
         state = ckpt.get('encoder')
     if state is None:
         state = {k[len('backbone.'):]: v for k,v in bare_state(ckpt[role]).items() if k.startswith('backbone.')}
-    state = {key: value for key, value in state.items() if key != 'masked_embed'}
+    if not keep_mask_token:
+        state = {key: value for key, value in state.items() if key != 'masked_embed'}
     model.load_state_dict(state,strict=True)
     model = IdentityEncoder(model, input_size=ckpt.get('input_size', 224))
     model.to(device).eval().requires_grad_(False)
@@ -140,7 +141,7 @@ def extract(model, tensor, device):
 
 
 class RetrievalValidation:
-    def __init__(self, config_path, batch_size, num_workers, image_size=224, include_source=False):
+    def __init__(self, config_path, batch_size, num_workers, image_size=224):
         from omegaconf import OmegaConf
         from .validation_data import validation_paths
 
@@ -154,27 +155,18 @@ class RetrievalValidation:
             raise ValueError('Validation needs at least two gallery identities and a Fake query')
         class_index = {identity: i for i, identity in enumerate(identities)}
 
-        def loader(idbook, skip_unreadable=False, source_labels=False):
+        def loader(idbook, skip_unreadable=False):
             missing = idbook.keys() - class_index.keys()
             if missing:
                 raise ValueError(f'Validation query identity {min(missing)} is missing from the gallery')
             samples = [(Path(path), class_index[identity])
                        for identity, paths in idbook.items() for path in paths]
-            if source_labels:
-                import re
-                paired = []
-                for path, target in samples:
-                    match = re.fullmatch(r'(?:id|n)?(\d+)_(?:id|n)?(\d+)', path.parent.name)
-                    if match is None or int(match[2]) not in class_index:
-                        raise ValueError(f'Fake Source identity missing from gallery or invalid pair folder: {path}')
-                    paired.append((path, (target, class_index[int(match[2])])))
-                samples = paired
             return DataLoader(samples, batch_size=batch_size, num_workers=num_workers,
                               collate_fn=partial(load_validation_batch, skip_unreadable=skip_unreadable,
                                                  image_size=image_size))
 
         self.gallery = loader(gallery)
-        self.fake = loader(fake, source_labels=include_source)
+        self.fake = loader(fake)
         self.real = loader(real, skip_unreadable=True)
         logging.info('Validation lists ready: %d gallery, %d Fake, %d Real candidates',
                      len(self.gallery.dataset), len(self.fake.dataset), len(self.real.dataset))
@@ -192,7 +184,6 @@ class RetrievalValidation:
             if not len(loader.dataset):
                 continue
             ranks = []
-            source_ranks = []
             count = 0
             for batch in loader:
                 if batch is None:
@@ -200,15 +191,12 @@ class RetrievalValidation:
                 images, labels = batch
                 count += len(labels)
                 labels = labels.to(device)
-                paired = labels.ndim == 2
-                cls = model(images.to(device), return_roles=True) if paired else model(images.to(device))
-                cls = F.normalize(cls.float(), dim=-1)
-                for role in range(2 if paired else 1):
-                    targets = labels[:, role, None] if paired else labels[:, None]
-                    scores = (cls[:, role] if paired else cls) @ centers.T
-                    correct_scores = scores.gather(1, targets)
-                    ahead = (scores > correct_scores) | ((scores == correct_scores) & (candidates < targets))
-                    (ranks if role == 0 else source_ranks).append(1 + ahead.sum(dim=1))
+                cls = F.normalize(model(images.to(device)).float(), dim=-1)
+                targets = labels[:, None]
+                scores = cls @ centers.T
+                correct_scores = scores.gather(1, targets)
+                ahead = (scores > correct_scores) | ((scores == correct_scores) & (candidates < targets))
+                ranks.append(1 + ahead.sum(dim=1))
             if count < len(loader.dataset):
                 logging.warning('Validation %s: skipped %d unreadable queries',
                                 name, len(loader.dataset) - count)
@@ -218,11 +206,6 @@ class RetrievalValidation:
             results[name] = {'top1': (ranks == 1).float().mean().item(),
                              'top5': (ranks <= 5).float().mean().item(),
                              'mrr': ranks.reciprocal().mean().item()}
-            if source_ranks:
-                source_ranks = torch.cat(source_ranks).float()
-                results['fake_source'] = {'top1': (source_ranks == 1).float().mean().item(),
-                                          'top5': (source_ranks <= 5).float().mean().item(),
-                                          'mrr': source_ranks.reciprocal().mean().item()}
         return results
 
 

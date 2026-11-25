@@ -16,8 +16,8 @@ class IdentityEncoder(nn.Module):
         self.input_size = input_size
         self.embed_dim = backbone.embed_dim
 
-    def forward(self, images):
-        return self.backbone(images)[:, 0]
+    def forward(self, images, mask=None):
+        return self.backbone(images, mask=mask)[:, 0]
 
 
 class ArcFace(nn.Module):
@@ -76,23 +76,3 @@ class Stage2(nn.Module):
         ).chunk(2)
         alignment = 1 - F.cosine_similarity(fake_features, real_features.detach()).mean()
         return fake_loss.mean(), real_loss.mean(), alignment
-
-
-class GroupStage2(Stage2):
-    """Four shared-head identity losses and two one-way alignment losses."""
-
-    def forward(self, fake, real_target, real_source, target_labels, source_labels):
-        with torch.autocast(
-            device_type=fake.device.type, dtype=torch.bfloat16, enabled=self.use_bf16
-        ):
-            roles = self.student(fake, return_roles=True)
-            real = self.real_encoder(torch.cat((real_target, real_source)))
-        fake_target, fake_source = roles.float().unbind(dim=1)
-        target, source = real.float().chunk(2)
-        features = torch.cat((fake_target, fake_source, target, source))
-        labels = torch.cat((target_labels, source_labels, target_labels, source_labels))
-        classification = F.cross_entropy(self.head(features, labels), labels, reduction="none")
-        fake_t, fake_s, real_t, real_s = (part.mean() for part in classification.chunk(4))
-        align_t = 1 - F.cosine_similarity(fake_target, target.detach()).mean()
-        align_s = 1 - F.cosine_similarity(fake_source, source.detach()).mean()
-        return fake_t, fake_s, real_t, real_s, align_t, align_s

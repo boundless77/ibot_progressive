@@ -63,12 +63,19 @@ def read_initial_checkpoint(args):
         raise ValueError('This experiment requires official ViT-B/16 weights')
     return checkpoint
 
-def load_models(checkpoint, student, teacher, initialize_decoder=False):
+def load_models(checkpoint, student, teacher, initialize_decoder=False, initialize_identity=False):
     student_state = bare_state(checkpoint['student'])
     if initialize_decoder:
         # Official iBOT has no decoder. All original parameters still load strictly.
         for name, value in student.decoder.state_dict().items():
             student_state['decoder.' + name] = value
+    if initialize_identity:
+        if any(k.startswith(('decoder.', 'arcface.')) for k in student_state):
+            raise ValueError('New identity experiment requires original iBOT weights, not a decoder/identity checkpoint')
+        if checkpoint.get('experiment', '').startswith('progressive-crfrp'):
+            raise ValueError('Start identity training from original iBOT weights, not stage1 output')
+        for name, value in student.arcface.state_dict().items():
+            student_state['arcface.' + name] = value
     student.load_state_dict(student_state, strict=True)
     teacher.load_state_dict(bare_state(checkpoint['teacher']), strict=True)
 
@@ -89,10 +96,17 @@ def capture_rng():
     return states
 
 def restore_experiment(checkpoint, args, optimizer, scaler, loss):
-    if checkpoint.get('experiment') != 'progressive-crfrp-v1':
+    identity = args.identity_weight > 0
+    expected = 'ibot-identity-v1' if identity else 'progressive-crfrp-v1'
+    if checkpoint.get('experiment') != expected:
         raise ValueError('--resume only accepts a checkpoint from this experiment')
     saved_args = checkpoint['args']
     saved_args = vars(saved_args) if isinstance(saved_args, argparse.Namespace) else saved_args
+    if identity:
+        for key in ('mask_mode', 'identity_weight', 'arcface_margin', 'arcface_scale',
+                    'num_classes', 'num_images', 'recordio_signature', 'blendface_masks'):
+            if saved_args.get(key) != getattr(args, key):
+                raise ValueError('Resume configuration differs: %s' % key)
     if saved_args.get('visible_decoder', False) != getattr(args, 'visible_decoder', False):
         raise ValueError('Resume configuration differs: visible_decoder')
     if getattr(args, 'visible_decoder', False):
@@ -103,10 +117,12 @@ def restore_experiment(checkpoint, args, optimizer, scaler, loss):
     for key in ('stages', 'epochs', 'batch_size_per_gpu', 'lr', 'min_lr', 'warmup_epochs',
                 'momentum_teacher', 'weight_decay', 'weight_decay_end', 'global_crops_scale',
                 'local_crops_scale', 'global_crops_number', 'local_crops_number', 'seed',
-                'data_path', 'parsing_root', 'require_full_organs', 'optimizer',
+                'data_path', 'require_full_organs', 'optimizer',
                 'teacher_temp', 'teacher_patch_temp', 'warmup_teacher_temp_epochs', 'use_fp16'):
         if saved_args.get(key) != getattr(args, key):
             raise ValueError('Resume configuration differs: %s' % key)
+    if not identity and saved_args.get('parsing_root') != args.parsing_root:
+        raise ValueError('Resume configuration differs: parsing_root')
     states = checkpoint['rng_states']
     start_epoch = checkpoint['epoch']
     rank, world_size = dist.get_rank(), dist.get_world_size()
