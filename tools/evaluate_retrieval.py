@@ -1,204 +1,118 @@
-"""Compare Stage 0..3 on a common gallery/query manifest and occlusion bank."""
+"""Evaluate checkpoints using the same YAML retrieval pipeline as training."""
 
 import _bootstrap
 import argparse
-import hashlib
+from io import StringIO
 import json
 import logging
+import sys
 from pathlib import Path
+
 import torch
-import torch.nn.functional as F
+from omegaconf import OmegaConf
+
 from progressive.checkpoints import trusted_load
-from progressive.evaluation import encoder_from_checkpoint, fixed_input, extract
+from progressive.evaluation import RetrievalValidation, encoder_from_checkpoint
 
 
-def extract_rows(
-    model,
-    rows,
-    root,
-    device,
-    name,
-    parsing_root=None,
-    mode="clean",
-    mask_bank=None,
-    fake_model=None,
-):
-    features = []
-    logging.info("Extracting %s: %d images", name, len(rows))
-    for index, row in enumerate(rows, 1):
-        encoder = fake_model if fake_model is not None and "target_id" in row else model
-        tensor, _ = fixed_input(
-            root / row["path"],
-            root,
-            parsing_root,
-            mode,
-            mask_bank,
-            image_size=encoder.input_size,
-        )
-        features.append(extract(encoder, tensor, device))
-        if index % 256 == 0 or index == len(rows):
-            logging.info("%s: %d/%d", name, index, len(rows))
-    return features
-
-
-def retrieval_metrics(qfeats, clean, centers, identities, queries, mode):
-    """Compute identity rankings in one batch; ties follow gallery identity order."""
-    features = torch.stack(qfeats)
-    scores = features @ centers.T
-    identity_index = {identity: index for index, identity in enumerate(identities)}
-    targets = torch.tensor(
-        [identity_index[str(q.get("target_id", q.get("identity")))] for q in queries]
-    )
-    positive = scores.gather(1, targets[:, None]).squeeze(1)
-    order = scores.argsort(dim=1, descending=True, stable=True)
-    hit1 = order[:, 0] == targets
-    hit5 = (order[:, :5] == targets[:, None]).any(1)
-    is_fake = torch.tensor(["target_id" in q for q in queries])
-    metrics = {
-        "queries": len(queries),
-        "gallery_identities": len(identities),
-        "top1": hit1.float().mean().item(),
-        "top5": hit5.float().mean().item(),
-        "same_identity_cosine_mean": positive.mean().item(),
-        "other_identity_cosine_mean": (
-            (scores.sum() - positive.sum()) / (len(queries) * (len(identities) - 1))
-        ).item(),
-        "clean_occluded_cosine_mean": (features * torch.stack(clean)).sum(1).mean().item(),
-    }
-    source_scores = []
-    for i, query in enumerate(queries):
-        if "source_id" in query:
-            source = scores[i, identity_index[str(query["source_id"])]]
-            source_scores.append(
-                {
-                    "path": query["path"],
-                    "s_target": positive[i].item(),
-                    "s_source": source.item(),
-                    "target_minus_source": (positive[i] - source).item(),
-                }
-            )
-    if source_scores:
-        metrics["fake_target_source_scores"] = source_scores
-        metrics["target_gt_source_fraction"] = sum(
-            row["target_minus_source"] > 0 for row in source_scores
-        ) / len(source_scores)
-    if is_fake.any():
-        metrics["fake_top1"] = hit1[is_fake].float().mean().item()
-        metrics["fake_top5"] = hit5[is_fake].float().mean().item()
-    prefix = "fake_" if is_fake.any() else ""
-    logging.info(
-        "[%s] %sTop-1: %.2f%%   Top-5: %.2f%%",
-        mode,
-        prefix,
-        100 * metrics[prefix + "top1"],
-        100 * metrics[prefix + "top5"],
-    )
-    return metrics
+def method_configs(config, requested=None):
+    methods = config.test.get('methods')
+    if methods is None:
+        if requested:
+            raise ValueError('--methods requires named methods under test.methods in the YAML')
+        yield 'default', config
+        return
+    if not OmegaConf.is_dict(methods) or not methods:
+        raise ValueError('test.methods must map method names to nonempty path lists')
+    if 'root_path' in config.test.data:
+        raise ValueError('Use either test.methods or test.data.root_path')
+    if requested:
+        missing = set(requested) - set(methods)
+        if missing:
+            raise ValueError(f'Unknown methods: {sorted(missing)}; available: {list(methods)}')
+    for name, roots in methods.items():
+        if requested and name not in requested:
+            continue
+        if not OmegaConf.is_list(roots) or not roots or any(not isinstance(p, str) for p in roots):
+            raise ValueError(f'test.methods.{name} must be a nonempty path list')
+        selected = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+        del selected.test.methods
+        selected.test.data.root_path = roots
+        yield name, selected
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoints", nargs="+", required=True)
-    p.add_argument("--manifest", required=True, help="JSON with gallery and queries lists")
-    p.add_argument("--data_root", required=True)
-    p.add_argument("--parsing_root")
-    p.add_argument("--mask_bank")
-    p.add_argument(
-        "--modes",
-        nargs="+",
-        default=["clean"],
-        choices=["clean", "single", "double", "triple", "inner"],
-        help="Optional diagnostic occlusions; normal identity retrieval uses clean images",
-    )
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--output", required=True)
-    args = p.parse_args()
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    log_path = out.with_suffix(".log")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--checkpoints', nargs='+', required=True)
+    parser.add_argument('--configs', nargs='+', required=True,
+                        help='Training validation YAML files, evaluated separately')
+    parser.add_argument('--methods', nargs='+',
+                        help='Evaluate only these YAML method names (default: all methods)')
+    parser.add_argument('--batch_size', type=int,
+                        help='Override YAML batch_size (default: 128)')
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--output', required=True, help='JSON output path; also writes a .log file')
+    args = parser.parse_args()
+    if (args.batch_size is not None and args.batch_size < 1) or args.num_workers < 0:
+        parser.error('batch_size must be positive and num_workers must be nonnegative')
+    output = Path(args.output)
+    if output.suffix.lower() != '.json':
+        parser.error('--output must end in .json')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    log_path = output.with_suffix('.log')
     logging.basicConfig(
         level=logging.INFO,
-        format="Testing: %(asctime)s-%(message)s",
-        handlers=[logging.FileHandler(log_path, mode="w", encoding="utf-8")],
+        format='Testing: %(asctime)s-%(message)s',
+        handlers=[logging.FileHandler(log_path, mode='w', encoding='utf-8'),
+                  logging.StreamHandler(sys.stdout)],
     )
-    logging.info("Manifest: %s   Device: %s", args.manifest, args.device)
-    torch.set_num_threads(2)
-    raw = Path(args.manifest).read_bytes()
-    manifest = json.loads(raw)
-    gallery, queries = manifest["gallery"], manifest["queries"]
-    if not gallery or not queries:
-        raise ValueError("Gallery and queries must be nonempty")
-    root = Path(args.data_root).resolve()
-    gallery_paths = {str((root / r["path"]).resolve()) for r in gallery}
-    if any(str((root / q["path"]).resolve()) in gallery_paths for q in queries):
-        raise ValueError("Gallery and query may not contain the exact same image")
-    # Reject duplicate bytes even when files have different names.
-    gallery_hashes = {hashlib.sha256((root / r["path"]).read_bytes()).digest() for r in gallery}
-    if any(
-        hashlib.sha256((root / q["path"]).read_bytes()).digest() in gallery_hashes for q in queries
-    ):
-        raise ValueError("Duplicate image content in gallery and queries")
-    identities = sorted({str(r["identity"]) for r in gallery})
-    if len(identities) < 2:
-        raise ValueError("Gallery must contain at least two identities")
-    for q in queries:
-        target = str(q.get("target_id", q.get("identity")))
-        if target not in identities or ("source_id" in q and str(q["source_id"]) not in identities):
-            raise ValueError("Gallery must contain query Target and Source identities")
-        if "source_id" in q and str(q["source_id"]) == target:
-            raise ValueError("Fake Target and Source must be different")
-    report = {
-        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
-        "note": "Full-image CLS retrieval: Real encoder for gallery/Real queries, Student for Fake queries.",
-        "checkpoints": {},
-    }
-    for checkpoint in args.checkpoints:
-        logging.info("Checkpoint: %s", checkpoint)
-        state = trusted_load(checkpoint)
-        model = encoder_from_checkpoint(state, args.device)
-        fake_model = (
-            encoder_from_checkpoint(state, args.device, role="student")
-            if "real_encoder" in state
-            else None
-        )
-        del state
-        gfeats = extract_rows(model, gallery, root, args.device, "Gallery")
-        clean = extract_rows(
-            model, queries, root, args.device, "Queries (clean)", fake_model=fake_model
-        )
-        identity_index = {identity: index for index, identity in enumerate(identities)}
-        gallery_labels = torch.tensor([identity_index[str(row["identity"])] for row in gallery])
-        gallery_features = torch.stack(gfeats)
-        centers = torch.zeros(len(identities), gallery_features.shape[1])
-        centers.index_add_(0, gallery_labels, gallery_features)
-        centers = F.normalize(centers, dim=1)
-        result = {}
-        for mode in args.modes:
-            qfeats = (
-                clean
-                if mode == "clean"
-                else extract_rows(
-                    model,
-                    queries,
-                    root,
-                    args.device,
-                    f"Queries ({mode})",
-                    args.parsing_root,
-                    mode,
-                    args.mask_bank,
-                    fake_model,
+    device = torch.device(args.device)
+    report = {'note': 'Training retrieval: full images, Real encoder for gallery/Real, '
+                      'Student for Fake; top1/top5 are fractions.',
+              'checkpoints': {}}
+    for checkpoint_path in args.checkpoints:
+        logging.info('Checkpoint: %s', checkpoint_path)
+        checkpoint = trusted_load(checkpoint_path)
+        student = encoder_from_checkpoint(checkpoint, device, role='student')
+        real_encoder = encoder_from_checkpoint(checkpoint, device, role='teacher')
+        del checkpoint
+        results = {}
+        report['checkpoints'][str(Path(checkpoint_path).resolve())] = results
+        for config_path in args.configs:
+            logging.info('Configuration: %s', config_path)
+            config = OmegaConf.load(config_path)
+            batch_size = args.batch_size if args.batch_size is not None else config.get('batch_size', 128)
+            if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+                raise ValueError(f'{config_path}: batch_size must be a positive integer')
+            method_results = {}
+            results[str(Path(config_path).resolve())] = method_results
+            for method, selected in method_configs(config, args.methods):
+                logging.info('Method: %s  Batch size: %d', method, batch_size)
+                validation = RetrievalValidation(
+                    StringIO(OmegaConf.to_yaml(selected, resolve=True)), batch_size, args.num_workers,
+                    image_size=student.input_size,
                 )
-            )
-            result[mode] = {
-                "identity": retrieval_metrics(qfeats, clean, centers, identities, queries, mode)
-            }
-        report["checkpoints"][str(Path(checkpoint).resolve())] = result
-        del model, fake_model
-        if args.device.startswith("cuda"):
+                metrics = validation.evaluate(student.eval(), real_encoder.eval(), device)
+                method_results[method] = {
+                    'config': OmegaConf.to_container(selected, resolve=True),
+                    'batch_size': batch_size,
+                    'gallery_identities': validation.num_identities,
+                    'gallery_images': len(validation.gallery.dataset),
+                    'fake_query_candidates': len(validation.fake.dataset),
+                    'real_query_candidates': len(validation.real.dataset),
+                    'metrics': metrics,
+                }
+                for role, scores in metrics.items():
+                    logging.info('%s/%s: Top-1 %.2f%%  Top-5 %.2f%%  MRR %.4f',
+                                 method, role, 100 * scores['top1'], 100 * scores['top5'], scores['mrr'])
+                output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
+                del validation
+        del student, real_encoder
+        if device.type == 'cuda':
             torch.cuda.empty_cache()
-    out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    logging.info("Saved results: %s   Log: %s", out, log_path)
+    logging.info('Saved results: %s  Log: %s', output, log_path)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

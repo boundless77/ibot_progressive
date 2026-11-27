@@ -1,0 +1,29 @@
+# Dataset directory: vgg2_100p_256
+# Gallery: first 5 readable images per identity.
+# Fake: sample up to 5 Source IDs per Target (seed 42), last 5 readable images per pair.
+# Real queries: all readable images, including Gallery images (same as training validation).
+# Methods are evaluated separately; batch_size only controls inference batches.
+batch_size: 128
+
+test_ori:
+  data:
+    root_path: [/mnt/home/chenxiaofu/facetrack/data/datasets/kl/vgg2_100p_256/real]
+    ratio: 1
+gallery:
+  data:
+    root_path: [/mnt/home/chenxiaofu/facetrack/data/datasets/kl/vgg2_100p_256/real]
+    ratio: 5
+test:
+  data:
+    ratio: -5
+  methods:
+    blendface:
+      - /mnt/home/chenxiaofu/facetrack/data/deepfakes/image/vgg2_100p_256/blendface
+    diffswap:
+      - /mnt/home/chenxiaofu/facetrack/data/deepfakes/image/vgg2_100p_256/diffswap_tgt0.001
+    e4s24:
+      - /mnt/home/chenxiaofu/facetrack/data/deepfakes/image/vgg2_100p_256/e4s24
+    infoswap:
+      - /mnt/home/chenxiaofu/facetrack/data/deepfakes/image/vgg2_100p_256/infoswap
+    simswap:
+      - /mnt/home/chenxiaofu/facetrack/data/deepfakes/image/vgg2_100p_256/simswap
