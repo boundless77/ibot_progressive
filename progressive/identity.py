@@ -17,6 +17,14 @@ class IdentityEncoder(nn.Module):
         self.embed_dim = backbone.embed_dim
 
     def forward(self, images, mask=None):
+        # Original iBOT asserts that a MIM-enabled backbone receives a mask,
+        # even in eval mode. An all-False mask preserves every image patch
+        # without changing the shared training backbone's MIM flag.
+        if mask is None and self.backbone.masked_im_modeling:
+            patch_size = self.backbone.patch_embed.patch_size
+            mask = torch.zeros(
+                (images.shape[0], images.shape[-2] // patch_size, images.shape[-1] // patch_size),
+                dtype=torch.bool, device=images.device)
         return self.backbone(images, mask=mask)[:, 0]
 
 

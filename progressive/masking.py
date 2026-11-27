@@ -17,6 +17,10 @@ REGIONS = [('brows', (2, 3)), ('eyes', (4, 5)), ('nose', (6,)),
            ('skin', (1,)), ('background', (0,))]
 
 
+class InvalidInnerFaceMask(ValueError):
+    """An inner-face mask leaves no masked patches or no visible patches."""
+
+
 class InnerFaceMask:
     """Mask every patch touching a binary BlendFace mask; no extra budget."""
 
@@ -27,9 +31,14 @@ class InnerFaceMask:
         p = self.patch_size
         h, w = labels.shape
         mask = labels.astype(bool).reshape(h // p, p, w // p, p).any(axis=(1, 3))
-        if not mask.any() or mask.all():
-            raise ValueError('Inner-face mask must leave both masked and visible patches')
         count = int(mask.sum())
+        if count == 0 or count == mask.size:
+            reason = 'no inner-face patch' if count == 0 else 'every patch intersects the inner face'
+            raise InvalidInnerFaceMask(
+                f'Invalid inner-face mask: {reason}; masked_patches={count}/{mask.size}, '
+                f'inner_pixels={np.count_nonzero(labels)}/{labels.size}, '
+                f'pixel_coverage={np.count_nonzero(labels) / labels.size:.6f}, '
+                f'image_size={w}x{h}, patch_size={p}')
         return mask, dict(stage=1, selected=list(ORGANS), target_ratio=float(mask.mean()),
                           actual_ratio=float(mask.mean()), forced_ratio=float(mask.mean()),
                           overflow=False, forced_patches=count, masked_patches=count,

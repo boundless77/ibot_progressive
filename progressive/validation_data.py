@@ -9,6 +9,8 @@ import cv2
 
 
 def get_all_image_files(directory):
+    if not Path(directory).is_dir():
+        raise FileNotFoundError(f'Validation image directory does not exist: {directory}')
     extensions = ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp')
     return [os.path.abspath(os.path.join(root, name)) for root, _, files in os.walk(directory)
             for name in files if name.lower().endswith(extensions)]

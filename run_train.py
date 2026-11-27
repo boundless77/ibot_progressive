@@ -63,6 +63,7 @@ TRAINING_DEFAULTS = {
     'identity_weight': 0.0,
     'arcface_margin': 0.5,
     'arcface_scale': 64.0,
+    'validation_config': '',
 }
 
 # Older project configs can contain these unused upstream options.
@@ -73,7 +74,7 @@ def read_stage1_config(path=DEFAULT_STAGE1_CONFIG, overrides=None):
     config = json.loads(Path(path).read_text(encoding='utf-8-sig'))
     config.update({key: value for key, value in (overrides or {}).items() if value is not None})
     for name in ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir',
-                 'blendface_masks', 'packed_mask_dir'):
+                 'blendface_masks', 'packed_mask_dir', 'validation_config'):
         if config.get(name):
             config[name] = str((ROOT / Path(config[name]).expanduser()).resolve())
     return config
@@ -82,7 +83,7 @@ def read_stage1_config(path=DEFAULT_STAGE1_CONFIG, overrides=None):
 def parse_config(default_config=DEFAULT_STAGE1_CONFIG):
     cli = argparse.ArgumentParser()
     cli.add_argument('--config', default=str(default_config))
-    for name in ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir', 'packed_mask_dir', 'blendface_masks'):
+    for name in ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir', 'packed_mask_dir', 'blendface_masks', 'validation_config'):
         cli.add_argument('--' + name)
     cli.add_argument('--batch_size_per_gpu', type=int)
     cli.add_argument('--num_workers', type=int)
@@ -92,7 +93,7 @@ def parse_config(default_config=DEFAULT_STAGE1_CONFIG):
     cli.add_argument('--local-rank', '--local_rank', type=int, default=0)
     parsed = cli.parse_args()
     keys = ('data_path', 'parsing_root', 'pretrained', 'resume', 'output_dir',
-            'batch_size_per_gpu', 'num_workers', 'lr', 'verbose', 'packed_mask_dir', 'blendface_masks')
+            'batch_size_per_gpu', 'num_workers', 'lr', 'verbose', 'packed_mask_dir', 'blendface_masks', 'validation_config')
     overrides = {name: getattr(parsed, name) for name in keys}
     if parsed.resume and parsed.pretrained is None:
         overrides['pretrained'] = ''
@@ -113,6 +114,8 @@ def parse_config(default_config=DEFAULT_STAGE1_CONFIG):
         config['output_dir'] = str(Path(config['resume']).parent)
     if config.get('verbose', 2000) < 1 or config.get('lr', 5e-5) <= 0:
         raise SystemExit('verbose and lr must be positive')
+    if config.get('validation_config') and not Path(config['validation_config']).is_file():
+        cli.error('validation_config does not exist: ' + config['validation_config'])
     data_root = Path(config['data_path'])
     if not all((data_root / name).is_file() for name in ('train.idx', 'train.rec')):
         cli.error('data_path must contain MS1Mv3 train.idx and train.rec')

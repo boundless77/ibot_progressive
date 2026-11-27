@@ -149,6 +149,8 @@ class RetrievalValidation:
         gallery = validation_paths(config.gallery.data)
         fake = validation_paths(config.test.data, fake=True)
         real = validation_paths(config.test_ori.data, check_readable=False)
+        if not real:
+            raise ValueError('Validation Real query list is empty; check test_ori paths')
         identities = sorted(gallery)
         self.num_identities = len(identities)
         if self.num_identities < 2 or not fake:

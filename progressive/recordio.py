@@ -9,9 +9,11 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+import torch
+from torch.utils.data import default_collate
 
 from .data import FaceMaskDataset
-from .masking import ORGANS, ProgressiveCRFRPMask
+from .masking import InvalidInnerFaceMask, ORGANS, ProgressiveCRFRPMask
 
 
 class PackedMasks:
@@ -168,6 +170,17 @@ class RecordIOFaceMaskDataset(FaceMaskDataset):
         return self.make_sample(index, image, Image.fromarray(labels))
 
 
+def collate_identity_samples(samples):
+    """Drop unusable-mask samples without refetching or changing loader step counts."""
+    valid = [sample for sample in samples if sample is not None]
+    if valid:
+        images, labels, masks, stats = default_collate(valid)
+    else:
+        images, labels, masks, stats = [], torch.empty(0, dtype=torch.long), [], {}
+    stats['_skipped'] = len(samples) - len(valid)
+    return images, labels, masks, stats
+
+
 class RecordIOIdentityMaskDataset(FaceMaskDataset):
     """All RecordIO images with existing identity labels and BlendFace binary masks."""
 
@@ -213,8 +226,24 @@ class RecordIOIdentityMaskDataset(FaceMaskDataset):
         label, image_id, image = read_record_with_id(self.reader, record)
         if label not in self.class_index:
             raise ValueError(f'Record {record}: identity {label} missing from idx2label.json')
-        mask = self.masks.get(label, image_id)
+        try:
+            mask = self.masks.get(label, image_id)
+        except KeyError:
+            # No mask for this image: use the same online skip path.
+            return None
         if mask.shape != (image.height, image.width):
-            raise ValueError(f'Record {record}: BlendFace mask and image sizes differ')
-        views, _, masks, stats = self.make_sample(index, image, Image.fromarray(mask.astype(np.uint8)))
+            return None
+        if not mask.any() or mask.all():
+            return None
+        try:
+            views, _, masks, stats = self.make_sample(index, image, Image.fromarray(mask.astype(np.uint8)))
+        except InvalidInnerFaceMask:
+            # Resizing/cropping and patch intersection can also remove every
+            # visible or masked patch, even when the original mask is mixed.
+            return None
+        except ValueError as exc:
+            raise ValueError(
+                f'Record {record}, identity={label}, image_id={image_id}, '
+                f'original_mask_shape={mask.shape}, '
+                f'original_mask_coverage={np.count_nonzero(mask) / mask.size:.6f}: {exc}') from exc
         return views, self.class_index[label], masks, stats
